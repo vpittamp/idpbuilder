@@ -35,7 +35,9 @@ const (
 	extraPackagesUsage             = "Paths to locations containing custom packages"
 	packageCustomizationFilesUsage = "Name of the package and the path to file to customize the core packages with. " +
 		"valid package names are: argocd, nginx, and gitea. e.g. argocd:/tmp/argocd.yaml"
-	noExitUsage = "When set, idpbuilder will not exit after all packages are synced. Useful for continuously syncing local directories."
+	registryMirrorsUsage         = "List of registry mirrors in format target=address (e.g. \"docker.io=http://kind-registry:5000,ghcr.io=http://kind-registry:5000\")"
+	insecureRegistryMirrorsUsage = "When set, configure registry mirrors with insecure TLS verification (skip_verify = true)."
+	noExitUsage                  = "When set, idpbuilder will not exit after all packages are synced. Useful for continuously syncing local directories."
 )
 
 var (
@@ -48,6 +50,8 @@ var (
 	kindConfigPath            string
 	extraPackages             []string
 	registryConfig            []string
+	registryMirrors           []string
+	insecureRegistryMirrors   bool
 	packageCustomizationFiles []string
 	noExit                    bool
 	protocol                  string
@@ -78,6 +82,8 @@ func init() {
 	CreateCmd.PersistentFlags().StringVar(&kindConfigPath, "kind-config", "", kindConfigPathUsage)
 	CreateCmd.PersistentFlags().StringSliceVar(&registryConfig, "registry-config", []string{}, registryConfigUsage)
 	CreateCmd.PersistentFlags().Lookup("registry-config").NoOptDefVal = "$XDG_RUNTIME_DIR/containers/auth.json,$HOME/.docker/config.json"
+	CreateCmd.PersistentFlags().StringSliceVar(&registryMirrors, "registry-mirrors", []string{}, registryMirrorsUsage)
+	CreateCmd.PersistentFlags().BoolVar(&insecureRegistryMirrors, "insecure-registry-mirrors", false, insecureRegistryMirrorsUsage)
 
 	// in-cluster resources related flags
 	CreateCmd.PersistentFlags().StringVar(&host, "host", globals.DefaultHostName, hostUsage)
@@ -136,6 +142,11 @@ func create(cmd *cobra.Command, args []string) error {
 		o[c.Name] = c
 	}
 
+	parsedMirrors, err := parseRegistryMirrors(registryMirrors)
+	if err != nil {
+		return err
+	}
+
 	exitOnSync := true
 	if cmd.Flags().Changed("no-exit") {
 		exitOnSync = !noExit
@@ -158,12 +169,14 @@ func create(cmd *cobra.Command, args []string) error {
 		RegistryConfig:    maybeRegistryConfig,
 
 		TemplateData: v1alpha1.BuildCustomizationSpec{
-			Protocol:       protocol,
-			Host:           host,
-			IngressHost:    ingressHost,
-			Port:           port,
-			UsePathRouting: pathRouting,
-			StaticPassword: devPassword,
+			Protocol:                protocol,
+			Host:                    host,
+			IngressHost:             ingressHost,
+			Port:                    port,
+			UsePathRouting:          pathRouting,
+			StaticPassword:          devPassword,
+			RegistryMirrors:         parsedMirrors,
+			InsecureRegistryMirrors: insecureRegistryMirrors,
 		},
 
 		CustomPackageFiles:   localFiles,
@@ -208,6 +221,12 @@ func validate() error {
 	}
 
 	_, _, _, err = helpers.ParsePackageStrings(extraPackages)
+	if err != nil {
+		return err
+	}
+
+	// Validate registry mirrors
+	_, err = parseRegistryMirrors(registryMirrors)
 	return err
 }
 
@@ -238,6 +257,45 @@ func getPackageCustomFile(input string) (v1alpha1.PackageCustomization, error) {
 		Name:     name,
 		FilePath: paths[0],
 	}, nil
+}
+
+func parseRegistryMirrors(mirrors []string) ([]v1alpha1.RegistryMirror, error) {
+	var result []v1alpha1.RegistryMirror
+	for _, mirror := range mirrors {
+		// Format: target=address (e.g. "docker.io=http://kind-registry:5000")
+		parts := strings.SplitN(mirror, "=", 2)
+		if len(parts) != 2 {
+			return nil, fmt.Errorf("invalid registry mirror format: %s, expected format: target=address (e.g. docker.io=http://kind-registry:5000)", mirror)
+		}
+
+		target := strings.TrimSpace(parts[0])
+		address := strings.TrimSpace(parts[1])
+
+		if target == "" {
+			return nil, fmt.Errorf("target registry cannot be empty in mirror: %s", mirror)
+		}
+		if address == "" {
+			return nil, fmt.Errorf("registry address cannot be empty in mirror: %s", mirror)
+		}
+
+		// target must be [hostname|ip][:port] (https://github.com/containerd/containerd/blob/main/docs/hosts.md#registry-host-namespace)
+		parsedTarget, err := url.Parse("https://" + target)
+		if err != nil || parsedTarget.Host == "" || parsedTarget.Path != "" {
+			return nil, fmt.Errorf("invalid target registry %q: expected format [hostname|ip][:port] (e.g. docker.io, 192.168.1.1:5000)", target)
+		}
+
+		// address must be a valid URL
+		parsedURL, err := url.Parse(address)
+		if err != nil || parsedURL.Scheme == "" || parsedURL.Host == "" {
+			return nil, fmt.Errorf("invalid registry address URL: %s, expected format: http(s)://host:port", address)
+		}
+
+		result = append(result, v1alpha1.RegistryMirror{
+			TargetRegistry:  target,
+			RegistryAddress: address,
+		})
+	}
+	return result, nil
 }
 
 func printSuccessMsg() {
