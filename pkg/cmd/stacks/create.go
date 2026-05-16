@@ -185,14 +185,20 @@ func bootstrapStacksGitOps(ctx context.Context, o *options) error {
 			return err
 		}
 	}
-	accessErr := withReadinessPhase(ctx, o, "wait-access", func() error {
-		return waitReadinessCohort(ctx, o, "access")
+	accessPhase := "check-access"
+	accessCheck := checkReadinessCohort
+	if o.StrictAccess {
+		accessPhase = "wait-access"
+		accessCheck = waitReadinessCohort
+	}
+	accessErr := withReadinessPhase(ctx, o, accessPhase, func() error {
+		return accessCheck(ctx, o, "access")
 	})
 	if accessErr != nil {
 		if o.StrictAccess {
 			return accessErr
 		}
-		fmt.Fprintf(os.Stderr, "warning: remote access cohort is not ready yet: %v\n", accessErr)
+		fmt.Fprintf(os.Stderr, "warning: remote access cohort is not ready yet; continuing without blocking local recreate: %v\n", accessErr)
 	}
 	if o.RefreshKubeconfig {
 		if err := withReadinessPhase(ctx, o, "refresh-kubeconfig", func() error {

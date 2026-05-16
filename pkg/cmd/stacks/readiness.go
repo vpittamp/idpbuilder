@@ -42,6 +42,10 @@ func waitReadinessCohort(ctx context.Context, o *options, cohort string) error {
 	return runReadiness(ctx, o, "wait", "--cohort", cohort)
 }
 
+func checkReadinessCohort(ctx context.Context, o *options, cohort string) error {
+	return runReadiness(ctx, o, "check", "--cohort", cohort)
+}
+
 func finishReadiness(ctx context.Context, o *options) error {
 	if err := runReadiness(ctx, o, "summary"); err != nil {
 		fmt.Fprintf(os.Stderr, "warning: could not print readiness summary: %v\n", err)
