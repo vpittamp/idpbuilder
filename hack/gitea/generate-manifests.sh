@@ -10,7 +10,7 @@ echo "# This file is auto-generated with 'hack/gitea/generate-manifests.sh'" >>$
 
 helm repo add gitea-charts --force-update https://dl.gitea.com/charts/
 helm repo update
-helm template my-gitea gitea-charts/gitea -f ${GITEA_DIR}/values.yaml --version ${CHART_VERSION} >>${INSTALL_YAML}
+helm template my-gitea gitea-charts/gitea -f ${GITEA_DIR}/values.yaml --version ${CHART_VERSION} --namespace gitea >>${INSTALL_YAML}
 sed -i.bak '3d' ${INSTALL_YAML}
 
 # helm template for pvc uses Release.namespace which doesn't get set

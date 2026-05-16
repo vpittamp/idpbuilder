@@ -6,10 +6,20 @@ LD_FLAGS=-ldflags " \
 
 # The name of the binary. Defaults to idpbuilder
 OUT_FILE ?= idpbuilder
+INSTALL_BIN_DIR ?= $(HOME)/.local/bin
 
 .PHONY: build
 build: manifests generate fmt vet embedded-resources
+	$(MAKE) build-binary OUT_FILE=$(OUT_FILE)
+
+.PHONY: build-binary
+build-binary:
 	go build $(LD_FLAGS) -o $(OUT_FILE) main.go
+
+.PHONY: install-local
+install-local:
+	mkdir -p $(INSTALL_BIN_DIR)
+	$(MAKE) build-binary OUT_FILE=$(INSTALL_BIN_DIR)/idpbuilder
 
 # ENVTEST_K8S_VERSION refers to the version of kubebuilder assets to be downloaded by envtest binary.
 ENVTEST_K8S_VERSION = 1.29.1
@@ -93,7 +103,7 @@ $(ENVTEST): $(LOCALBIN)
 
 .PHONY: embedded-resources
 embedded-resources: kustomize helm
-	export PATH=$(LOCALBIN):$$PATH; ./hack/embedded-resources.sh;
+	export PATH=$(LOCALBIN):$$PATH; bash ./hack/embedded-resources.sh;
 
 .PHONY: e2e
 e2e: build
