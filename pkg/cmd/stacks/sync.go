@@ -122,6 +122,12 @@ func waitForHTTP(ctx context.Context, target string, timeout time.Duration) erro
 }
 
 func ensureGiteaRepository(ctx context.Context, port int, o *options) error {
+	if exists, err := giteaRepositoryExists(ctx, port, o); err != nil {
+		return err
+	} else if exists {
+		return nil
+	}
+
 	body, err := json.Marshal(map[string]any{
 		"name":           o.GiteaRepo,
 		"private":        false,
@@ -132,25 +138,66 @@ func ensureGiteaRepository(ctx context.Context, port int, o *options) error {
 		return err
 	}
 	endpoint := fmt.Sprintf("http://127.0.0.1:%d/api/v1/user/repos", port)
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, strings.NewReader(string(body)))
+	var lastErr error
+	for attempt := 1; attempt <= 6; attempt++ {
+		req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, strings.NewReader(string(body)))
+		if err != nil {
+			return err
+		}
+		req.SetBasicAuth(o.GiteaUser, o.GiteaPassword)
+		req.Header.Set("Content-Type", "application/json")
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			lastErr = fmt.Errorf("creating Gitea repository %s/%s: %w", o.GiteaOwner, o.GiteaRepo, err)
+		} else {
+			data, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+			_ = resp.Body.Close()
+			if resp.StatusCode >= 200 && resp.StatusCode < 300 {
+				return nil
+			}
+			if resp.StatusCode == http.StatusConflict || resp.StatusCode == http.StatusUnprocessableEntity {
+				return nil
+			}
+			lastErr = fmt.Errorf("creating Gitea repository %s/%s returned %s: %s", o.GiteaOwner, o.GiteaRepo, resp.Status, strings.TrimSpace(string(data)))
+			if resp.StatusCode < 500 {
+				return lastErr
+			}
+		}
+		if exists, err := giteaRepositoryExists(ctx, port, o); err != nil {
+			lastErr = err
+		} else if exists {
+			return nil
+		}
+		select {
+		case <-ctx.Done():
+			return context.Cause(ctx)
+		case <-time.After(time.Duration(attempt) * time.Second):
+		}
+	}
+	return lastErr
+}
+
+func giteaRepositoryExists(ctx context.Context, port int, o *options) (bool, error) {
+	endpoint := fmt.Sprintf("http://127.0.0.1:%d/api/v1/repos/%s/%s", port, url.PathEscape(o.GiteaOwner), url.PathEscape(o.GiteaRepo))
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
 	if err != nil {
-		return err
+		return false, err
 	}
 	req.SetBasicAuth(o.GiteaUser, o.GiteaPassword)
-	req.Header.Set("Content-Type", "application/json")
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
-		return fmt.Errorf("creating Gitea repository %s/%s: %w", o.GiteaOwner, o.GiteaRepo, err)
+		return false, fmt.Errorf("checking Gitea repository %s/%s: %w", o.GiteaOwner, o.GiteaRepo, err)
 	}
 	defer resp.Body.Close()
-	if resp.StatusCode >= 200 && resp.StatusCode < 300 {
-		return nil
+	switch resp.StatusCode {
+	case http.StatusOK:
+		return true, nil
+	case http.StatusNotFound:
+		return false, nil
+	default:
+		data, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+		return false, fmt.Errorf("checking Gitea repository %s/%s returned %s: %s", o.GiteaOwner, o.GiteaRepo, resp.Status, strings.TrimSpace(string(data)))
 	}
-	if resp.StatusCode == http.StatusConflict || resp.StatusCode == http.StatusUnprocessableEntity {
-		return nil
-	}
-	data, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
-	return fmt.Errorf("creating Gitea repository %s/%s returned %s: %s", o.GiteaOwner, o.GiteaRepo, resp.Status, strings.TrimSpace(string(data)))
 }
 
 func pushSnapshot(ctx context.Context, port int, o *options) (syncResult, error) {
