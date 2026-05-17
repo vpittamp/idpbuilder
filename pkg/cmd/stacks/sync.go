@@ -1,6 +1,7 @@
 package stacks
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -21,6 +22,7 @@ import (
 type syncResult struct {
 	Commit string
 	Files  int
+	Noop   bool
 }
 
 type portForward struct {
@@ -45,8 +47,12 @@ func sync(ctx context.Context, o *options) (syncResult, error) {
 	if err != nil {
 		return syncResult{}, err
 	}
+	if result.Noop {
+		fmt.Println("No changes to sync")
+		return result, nil
+	}
 	refreshRootApplication(ctx, o)
-	fmt.Printf("Synced %d files from %s to %s/%s:%s at %s\n", result.Files, o.StacksRepo, o.GiteaOwner, o.GiteaRepo, o.Branch, result.Commit)
+	fmt.Printf("Synced %d changed files from %s to %s/%s:%s at %s\n", result.Files, o.StacksRepo, o.GiteaOwner, o.GiteaRepo, o.Branch, result.Commit)
 	return result, nil
 }
 
@@ -201,52 +207,216 @@ func giteaRepositoryExists(ctx context.Context, port int, o *options) (bool, err
 }
 
 func pushSnapshot(ctx context.Context, port int, o *options) (syncResult, error) {
+	return pushSnapshotToRemote(ctx, giteaRemoteURL(port, o), o)
+}
+
+func pushSnapshotToRemote(ctx context.Context, remote string, o *options) (syncResult, error) {
 	files, err := snapshotFiles(ctx, o.StacksRepo)
 	if err != nil {
 		return syncResult{}, err
 	}
-	tmp, err := os.MkdirTemp("", "idpbuilder-stacks-snapshot-*")
+	cacheDir, err := syncCachePath(o)
 	if err != nil {
-		return syncResult{}, fmt.Errorf("creating snapshot temp dir: %w", err)
+		return syncResult{}, err
 	}
-	defer os.RemoveAll(tmp)
-
+	if err := prepareSyncCache(ctx, cacheDir, remote, o); err != nil {
+		return syncResult{}, err
+	}
+	if err := clearCacheWorktree(cacheDir); err != nil {
+		return syncResult{}, err
+	}
 	for _, file := range files {
-		if err := copySnapshotPath(o.StacksRepo, tmp, file); err != nil {
+		if err := copySnapshotPath(o.StacksRepo, cacheDir, file); err != nil {
 			return syncResult{}, err
 		}
 	}
 	if o.RewriteBootstrapImagePins {
-		if err := rewriteBootstrapImagePins(ctx, o, tmp); err != nil {
+		if err := rewriteBootstrapImagePins(ctx, o, cacheDir); err != nil {
 			return syncResult{}, err
 		}
 	}
-
-	if err := run(ctx, tmp, os.Environ(), "git", "init", "-b", o.Branch); err != nil {
+	if err := run(ctx, cacheDir, os.Environ(), "git", "add", "-A"); err != nil {
 		return syncResult{}, err
 	}
-	if err := run(ctx, tmp, os.Environ(), "git", "config", "user.name", "idpbuilder-stacks"); err != nil {
-		return syncResult{}, err
-	}
-	if err := run(ctx, tmp, os.Environ(), "git", "config", "user.email", "idpbuilder-stacks@cnoe.local"); err != nil {
-		return syncResult{}, err
-	}
-	if err := run(ctx, tmp, os.Environ(), "git", "add", "-A"); err != nil {
-		return syncResult{}, err
-	}
-	message := fmt.Sprintf("sync stacks snapshot %s", time.Now().Format(time.RFC3339))
-	if err := run(ctx, tmp, os.Environ(), "git", "commit", "--allow-empty", "-m", message); err != nil {
-		return syncResult{}, err
-	}
-	commit, err := output(ctx, tmp, os.Environ(), "git", "rev-parse", "HEAD")
+	changed, err := stagedChangedFiles(ctx, cacheDir)
 	if err != nil {
 		return syncResult{}, err
 	}
-	remote := giteaRemoteURL(port, o)
-	if err := run(ctx, tmp, os.Environ(), "git", "push", "--force", remote, "HEAD:refs/heads/"+o.Branch); err != nil {
+	if len(changed) == 0 {
+		return syncResult{Noop: true}, nil
+	}
+	message := fmt.Sprintf("sync stacks snapshot %s", time.Now().Format(time.RFC3339))
+	if err := run(ctx, cacheDir, os.Environ(), "git", "commit", "-m", message); err != nil {
 		return syncResult{}, err
 	}
-	return syncResult{Commit: strings.TrimSpace(commit), Files: len(files)}, nil
+	commit, err := output(ctx, cacheDir, os.Environ(), "git", "rev-parse", "HEAD")
+	if err != nil {
+		return syncResult{}, err
+	}
+	args := []string{"push", "origin", "HEAD:refs/heads/" + o.Branch}
+	if o.ResetLocalHistory {
+		args = []string{"push", "--force", "origin", "HEAD:refs/heads/" + o.Branch}
+	}
+	if _, err := output(ctx, cacheDir, os.Environ(), "git", args...); err != nil {
+		if !o.ResetLocalHistory {
+			return syncResult{}, fmt.Errorf("Refusing non-fast-forward push; run with --reset-local-history to replace local Gitea history: %w", err)
+		}
+		return syncResult{}, err
+	}
+	return syncResult{Commit: strings.TrimSpace(commit), Files: len(changed)}, nil
+}
+
+func syncCachePath(o *options) (string, error) {
+	if o.CacheDir != "" {
+		return filepath.Abs(o.CacheDir)
+	}
+	root := os.Getenv("XDG_CACHE_HOME")
+	if root == "" {
+		home, err := os.UserHomeDir()
+		if err != nil {
+			return "", fmt.Errorf("resolving home directory for sync cache: %w", err)
+		}
+		root = filepath.Join(home, ".cache")
+	}
+	return filepath.Join(root, "idpbuilder", "stacks-sync", safeCacheSegment(o.ClusterName), safeCacheSegment(o.GiteaOwner), safeCacheSegment(o.GiteaRepo)), nil
+}
+
+func safeCacheSegment(value string) string {
+	value = strings.TrimSpace(value)
+	value = strings.ReplaceAll(value, string(filepath.Separator), "_")
+	value = strings.ReplaceAll(value, "/", "_")
+	value = strings.ReplaceAll(value, "\\", "_")
+	if value == "" || value == "." || value == ".." {
+		return "_"
+	}
+	return value
+}
+
+func prepareSyncCache(ctx context.Context, cacheDir, remote string, o *options) error {
+	if _, err := os.Stat(filepath.Join(cacheDir, ".git")); err != nil {
+		if !os.IsNotExist(err) {
+			return fmt.Errorf("checking sync cache %s: %w", cacheDir, err)
+		}
+		if err := os.RemoveAll(cacheDir); err != nil {
+			return fmt.Errorf("clearing invalid sync cache %s: %w", cacheDir, err)
+		}
+		if err := os.MkdirAll(filepath.Dir(cacheDir), 0o755); err != nil {
+			return fmt.Errorf("creating sync cache parent: %w", err)
+		}
+		if err := run(ctx, filepath.Dir(cacheDir), os.Environ(), "git", "clone", remote, cacheDir); err != nil {
+			return err
+		}
+	} else {
+		if err := run(ctx, cacheDir, os.Environ(), "git", "remote", "set-url", "origin", remote); err != nil {
+			return err
+		}
+	}
+	if err := run(ctx, cacheDir, os.Environ(), "git", "config", "user.name", "idpbuilder-stacks"); err != nil {
+		return err
+	}
+	if err := run(ctx, cacheDir, os.Environ(), "git", "config", "user.email", "idpbuilder-stacks@cnoe.local"); err != nil {
+		return err
+	}
+	if err := resetCacheGitState(ctx, cacheDir); err != nil {
+		return err
+	}
+	if o.ResetLocalHistory {
+		return checkoutOrphan(ctx, cacheDir, o.Branch)
+	}
+	if err := run(ctx, cacheDir, os.Environ(), "git", "fetch", "--prune", "origin"); err != nil {
+		return err
+	}
+	if exists, err := gitRefExists(ctx, cacheDir, "refs/remotes/origin/"+o.Branch); err != nil {
+		return err
+	} else if exists {
+		return run(ctx, cacheDir, os.Environ(), "git", "checkout", "-B", o.Branch, "refs/remotes/origin/"+o.Branch)
+	}
+	hasHeads, err := remoteHasAnyHead(ctx, cacheDir)
+	if err != nil {
+		return err
+	}
+	if hasHeads {
+		return fmt.Errorf("Refusing non-fast-forward push; run with --reset-local-history to replace local Gitea history: remote branch %q is missing", o.Branch)
+	}
+	return checkoutOrphan(ctx, cacheDir, o.Branch)
+}
+
+func resetCacheGitState(ctx context.Context, cacheDir string) error {
+	hasHead, err := gitRefExists(ctx, cacheDir, "HEAD")
+	if err != nil {
+		return err
+	}
+	if !hasHead {
+		return nil
+	}
+	if err := run(ctx, cacheDir, os.Environ(), "git", "reset", "--hard"); err != nil {
+		return err
+	}
+	return run(ctx, cacheDir, os.Environ(), "git", "clean", "-fdx")
+}
+
+func checkoutOrphan(ctx context.Context, dir, branch string) error {
+	orphanBranch := fmt.Sprintf("idpbuilder-%s-reset-%d", safeCacheSegment(branch), time.Now().UnixNano())
+	if err := run(ctx, dir, os.Environ(), "git", "checkout", "--orphan", orphanBranch); err != nil {
+		return err
+	}
+	return nil
+}
+
+func gitRefExists(ctx context.Context, dir, ref string) (bool, error) {
+	cmd := exec.CommandContext(ctx, "git", "rev-parse", "--verify", "--quiet", ref)
+	cmd.Dir = dir
+	cmd.Env = os.Environ()
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+	err := cmd.Run()
+	if err == nil {
+		return true, nil
+	}
+	if exit, ok := err.(*exec.ExitError); ok && exit.ExitCode() == 1 {
+		return false, nil
+	}
+	return false, fmt.Errorf("checking git ref %s: %s", ref, strings.TrimSpace(stderr.String()))
+}
+
+func remoteHasAnyHead(ctx context.Context, dir string) (bool, error) {
+	out, err := output(ctx, dir, os.Environ(), "git", "ls-remote", "--heads", "origin")
+	if err != nil {
+		return false, err
+	}
+	return strings.TrimSpace(out) != "", nil
+}
+
+func clearCacheWorktree(cacheDir string) error {
+	entries, err := os.ReadDir(cacheDir)
+	if err != nil {
+		return fmt.Errorf("reading sync cache %s: %w", cacheDir, err)
+	}
+	for _, entry := range entries {
+		if entry.Name() == ".git" {
+			continue
+		}
+		if err := os.RemoveAll(filepath.Join(cacheDir, entry.Name())); err != nil {
+			return fmt.Errorf("clearing sync cache path %s: %w", entry.Name(), err)
+		}
+	}
+	return nil
+}
+
+func stagedChangedFiles(ctx context.Context, dir string) ([]string, error) {
+	out, err := output(ctx, dir, os.Environ(), "git", "diff", "--cached", "--name-only", "-z")
+	if err != nil {
+		return nil, err
+	}
+	parts := strings.Split(out, "\x00")
+	files := make([]string, 0, len(parts))
+	for _, part := range parts {
+		if part != "" {
+			files = append(files, part)
+		}
+	}
+	sort.Strings(files)
+	return files, nil
 }
 
 func rewriteBootstrapImagePins(ctx context.Context, o *options, snapshotDir string) error {

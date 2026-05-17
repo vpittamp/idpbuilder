@@ -43,19 +43,22 @@ const (
 )
 
 type options struct {
-	Profile       string
-	Provider      string
-	StacksRepo    string
-	Overlay       string
-	Branch        string
-	ClusterName   string
-	GiteaOwner    string
-	GiteaRepo     string
-	GiteaUser     string
-	GiteaPassword string
-	Watch         bool
-	WatchInterval time.Duration
-	Recreate      bool
+	Profile           string
+	Provider          string
+	StacksRepo        string
+	Overlay           string
+	Branch            string
+	ClusterName       string
+	GiteaOwner        string
+	GiteaRepo         string
+	GiteaUser         string
+	GiteaPassword     string
+	Watch             bool
+	WatchInterval     time.Duration
+	WatchDebounce     time.Duration
+	ResetLocalHistory bool
+	CacheDir          string
+	Recreate          bool
 
 	SkipAzureCheck      bool
 	SkipArgocdInit      bool
@@ -171,6 +174,9 @@ func newStacksCmd() *cobra.Command {
 			return runStacksCommand(cmd.Context(), opts, "sync", func(ctx context.Context) error {
 				syncOptions := *opts
 				syncOptions.RewriteBootstrapImagePins = opts.SeedImages && opts.SeedImagesMode == "release-pins"
+				if syncOptions.Watch {
+					return watchAndSync(ctx, &syncOptions)
+				}
 				_, err := sync(ctx, &syncOptions)
 				return err
 			})
@@ -178,6 +184,12 @@ func newStacksCmd() *cobra.Command {
 	}
 	syncCmd.Flags().BoolVar(&opts.SeedImages, "seed-images", true, "rewrite ryzen bootstrap image references from release pins into the local Gitea snapshot")
 	syncCmd.Flags().StringVar(&opts.SeedImagesMode, "seed-images-mode", "release-pins", "bootstrap image rewrite mode; only release-pins is supported")
+	syncCmd.Flags().BoolVar(&opts.Watch, "watch", false, "continue syncing local worktree changes")
+	syncCmd.Flags().DurationVar(&opts.WatchDebounce, "debounce", opts.WatchDebounce, "debounce duration for --watch")
+	syncCmd.Flags().BoolVar(&opts.ResetLocalHistory, "reset-local-history", false, "replace the in-cluster Gitea branch history from the current snapshot")
+	syncCmd.Flags().StringVar(&opts.CacheDir, "cache-dir", "", "persistent cache clone directory for stacks sync")
+	syncCmd.Flags().StringVar(&opts.ContainerEngine, "container-engine", opts.ContainerEngine, "container engine for stacks provider compatibility: auto, docker, or podman")
+	syncCmd.Flags().StringVar(&opts.SeedImagePushEngine, "seed-image-push-engine", opts.SeedImagePushEngine, "image push engine for bootstrap compatibility: auto, docker, or skopeo")
 
 	statusCmd := &cobra.Command{
 		Use:   "status",
@@ -212,6 +224,7 @@ func defaultOptions() *options {
 		GiteaUser:           defaultGiteaUser,
 		GiteaPassword:       defaultGiteaPass,
 		WatchInterval:       3 * time.Second,
+		WatchDebounce:       2 * time.Second,
 		SkipAzureCheck:      true,
 		SkipTektonBuild:     true,
 		SeedImages:          true,
@@ -278,6 +291,9 @@ func (o *options) validate() error {
 	}
 	if o.SeedImageJobs < 1 {
 		return fmt.Errorf("--seed-image-jobs must be at least 1")
+	}
+	if o.WatchDebounce <= 0 {
+		return fmt.Errorf("--debounce must be greater than 0")
 	}
 	if !validContainerEngine(o.ContainerEngine) {
 		return fmt.Errorf("unsupported --container-engine %q; expected auto, docker, or podman", o.ContainerEngine)
@@ -404,28 +420,48 @@ func withStacksEnv(o *options, extra ...string) []string {
 }
 
 func watchAndSync(ctx context.Context, o *options) error {
-	fmt.Printf("Watching %s for stacks changes every %s\n", o.StacksRepo, o.WatchInterval)
+	fmt.Printf("Watching %s for stacks changes with %s debounce\n", o.StacksRepo, o.WatchDebounce)
 	last, err := snapshotHash(ctx, o.StacksRepo)
 	if err != nil {
 		return err
 	}
-	ticker := time.NewTicker(o.WatchInterval)
+	pollInterval := 500 * time.Millisecond
+	if o.WatchInterval > 0 && o.WatchInterval < pollInterval {
+		pollInterval = o.WatchInterval
+	}
+	ticker := time.NewTicker(pollInterval)
 	defer ticker.Stop()
+	var pending string
+	var lastChange time.Time
 	for {
-		hash, err := snapshotHash(ctx, o.StacksRepo)
-		if err != nil {
-			return err
-		}
-		if hash != last {
-			if _, err := sync(ctx, o); err != nil {
-				return err
-			}
-			last = hash
-		}
 		select {
 		case <-ctx.Done():
 			return context.Cause(ctx)
 		case <-ticker.C:
+			hash, err := snapshotHash(ctx, o.StacksRepo)
+			if err != nil {
+				return err
+			}
+			if pending != "" && hash == last {
+				pending = ""
+				continue
+			}
+			if hash != last && hash != pending {
+				pending = hash
+				lastChange = time.Now()
+				continue
+			}
+			if pending == "" || time.Since(lastChange) < o.WatchDebounce {
+				continue
+			}
+			if _, err := sync(ctx, o); err != nil {
+				return err
+			}
+			last, err = snapshotHash(ctx, o.StacksRepo)
+			if err != nil {
+				return err
+			}
+			pending = ""
 		}
 	}
 }
