@@ -255,7 +255,7 @@ func rewriteBootstrapImagePins(ctx context.Context, o *options, snapshotDir stri
 		script,
 		"--mode", "critical",
 		"--rewrite-kustomizations", snapshotDir,
-		"--rewrite-registry", fmt.Sprintf("gitea.cnoe.localtest.me:8443/%s", o.GiteaOwner),
+		"--rewrite-registry", fmt.Sprintf("gitea.cnoe.localtest.me/%s", o.GiteaOwner),
 		"--skip-copy",
 		"--quiet",
 	}

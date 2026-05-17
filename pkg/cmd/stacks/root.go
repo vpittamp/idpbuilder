@@ -16,12 +16,15 @@ const (
 	providerKind        = "kind"
 	providerTalosDocker = "talos-docker"
 
-	defaultProfile     = "ryzen"
-	defaultOverlay     = "packages/overlays/kind-ryzen"
-	defaultClusterName = "ryzen"
-	defaultBranch      = "main"
-	defaultGiteaUser   = "giteaadmin"
-	defaultGiteaPass   = "developer"
+	defaultProfile                    = "ryzen"
+	defaultOverlay                    = "packages/overlays/ryzen"
+	defaultLegacyKindOverlay          = "packages/overlays/kind-ryzen"
+	defaultClusterName                = "ryzen"
+	defaultReadinessProfile           = "deployment/config/readiness/ryzen.yaml"
+	defaultLegacyKindReadinessProfile = "deployment/config/readiness/kind-ryzen.yaml"
+	defaultBranch                     = "main"
+	defaultGiteaUser                  = "giteaadmin"
+	defaultGiteaPass                  = "developer"
 )
 
 type options struct {
@@ -44,6 +47,7 @@ type options struct {
 	SkipTektonBuild    bool
 	SeedImages         bool
 	SeedImagesMode     string
+	SeedImageJobs      int
 	RefreshKubeconfig  bool
 	PushKubeconfigHost string
 	EnforceSLO         bool
@@ -57,6 +61,11 @@ type options struct {
 	TalosImage         string
 	TalosSubnet        string
 	TalosWorkers       int
+	TalosControlMemory string
+	TalosWorkerMemory  string
+	TalosControlCPUs   string
+	TalosWorkerCPUs    string
+	TalosOIDCIssuerURL string
 	TalosConfigPatches []string
 	TalosMounts        []string
 	TalosExposedPorts  []string
@@ -76,12 +85,13 @@ func newStacksCmd() *cobra.Command {
 			if err := helpers.SetLogger(); err != nil {
 				return err
 			}
+			opts.applyProviderDefaults(cmd)
 			return opts.validate()
 		},
 	}
 
 	cmd.PersistentFlags().StringVar(&opts.Profile, "profile", opts.Profile, "stacks profile to use")
-	cmd.PersistentFlags().StringVar(&opts.Provider, "provider", opts.Provider, "cluster provider: kind or talos-docker")
+	cmd.PersistentFlags().StringVar(&opts.Provider, "provider", opts.Provider, "cluster provider: talos-docker or kind")
 	cmd.PersistentFlags().StringVar(&opts.StacksRepo, "stacks-repo", opts.StacksRepo, "path to the PittampalliOrg/stacks repository")
 	cmd.PersistentFlags().StringVar(&opts.Overlay, "overlay", opts.Overlay, "overlay path inside the stacks repository")
 	cmd.PersistentFlags().StringVar(&opts.Branch, "branch", opts.Branch, "branch to publish into in-cluster Gitea")
@@ -112,6 +122,7 @@ func newStacksCmd() *cobra.Command {
 	createCmd.Flags().BoolVar(&opts.SkipTektonBuild, "skip-tekton-builds", true, "skip background Tekton image build triggers")
 	createCmd.Flags().BoolVar(&opts.SeedImages, "seed-images", true, "seed ryzen bootstrap images from release pins into local Gitea")
 	createCmd.Flags().StringVar(&opts.SeedImagesMode, "seed-images-mode", "release-pins", "bootstrap image seed mode; only release-pins is supported")
+	createCmd.Flags().IntVar(&opts.SeedImageJobs, "seed-image-jobs", 4, "number of ryzen bootstrap images to seed concurrently")
 	createCmd.Flags().BoolVar(&opts.RefreshKubeconfig, "refresh-kubeconfig", true, "refresh local kubeconfig after create")
 	createCmd.Flags().StringVar(&opts.PushKubeconfigHost, "push-kubeconfig-host", "", "optional SSH host to receive refreshed Tailscale kubeconfig")
 	createCmd.Flags().BoolVar(&opts.EnforceSLO, "enforce-slo", false, "fail when recreate timings regress beyond the readiness baseline")
@@ -121,9 +132,14 @@ func newStacksCmd() *cobra.Command {
 	createCmd.Flags().StringVar(&opts.TalosImage, "talos-image", "", "Talos image for talos-docker; default is read from the dev Talos claim")
 	createCmd.Flags().StringVar(&opts.TalosSubnet, "talos-subnet", "10.6.0.0/24", "Docker subnet for talos-docker")
 	createCmd.Flags().IntVar(&opts.TalosWorkers, "talos-workers", 2, "worker count for talos-docker")
+	createCmd.Flags().StringVar(&opts.TalosControlMemory, "talos-controlplane-memory", opts.TalosControlMemory, "memory limit for each talos-docker control plane node")
+	createCmd.Flags().StringVar(&opts.TalosWorkerMemory, "talos-worker-memory", opts.TalosWorkerMemory, "memory limit for each talos-docker worker node")
+	createCmd.Flags().StringVar(&opts.TalosControlCPUs, "talos-controlplane-cpus", opts.TalosControlCPUs, "CPU share for each talos-docker control plane node")
+	createCmd.Flags().StringVar(&opts.TalosWorkerCPUs, "talos-worker-cpus", opts.TalosWorkerCPUs, "CPU share for each talos-docker worker node")
+	createCmd.Flags().StringVar(&opts.TalosOIDCIssuerURL, "talos-oidc-issuer-url", opts.TalosOIDCIssuerURL, "service-account issuer URL for talos-docker Azure Workload Identity")
 	createCmd.Flags().StringSliceVar(&opts.TalosConfigPatches, "talos-config-patch", nil, "Talos machine config patch passed to talosctl cluster create docker")
 	createCmd.Flags().StringSliceVar(&opts.TalosMounts, "talos-mount", nil, "Docker mount passed to talosctl cluster create docker")
-	createCmd.Flags().StringSliceVarP(&opts.TalosExposedPorts, "talos-exposed-port", "p", []string{"8443:443/tcp"}, "port mapping passed to talosctl cluster create docker")
+	createCmd.Flags().StringSliceVarP(&opts.TalosExposedPorts, "talos-exposed-port", "p", opts.TalosExposedPorts, "port mapping passed to talosctl cluster create docker")
 
 	syncCmd := &cobra.Command{
 		Use:   "sync",
@@ -158,26 +174,33 @@ func defaultOptions() *options {
 		}
 	}
 	return &options{
-		Profile:           defaultProfile,
-		Provider:          providerKind,
-		StacksRepo:        stacksRepo,
-		Overlay:           defaultOverlay,
-		Branch:            defaultBranch,
-		ClusterName:       defaultClusterName,
-		GiteaOwner:        defaultGiteaUser,
-		GiteaRepo:         "stacks",
-		GiteaUser:         defaultGiteaUser,
-		GiteaPassword:     defaultGiteaPass,
-		WatchInterval:     3 * time.Second,
-		SkipAzureCheck:    true,
-		SkipTektonBuild:   true,
-		SeedImages:        true,
-		SeedImagesMode:    "release-pins",
-		RefreshKubeconfig: true,
-		TalosSubnet:       "10.6.0.0/24",
-		TalosWorkers:      2,
+		Profile:            defaultProfile,
+		Provider:           providerTalosDocker,
+		StacksRepo:         stacksRepo,
+		Overlay:            defaultOverlay,
+		Branch:             defaultBranch,
+		ClusterName:        defaultClusterName,
+		GiteaOwner:         defaultGiteaUser,
+		GiteaRepo:          "stacks",
+		GiteaUser:          defaultGiteaUser,
+		GiteaPassword:      defaultGiteaPass,
+		WatchInterval:      3 * time.Second,
+		SkipAzureCheck:     true,
+		SkipTektonBuild:    true,
+		SeedImages:         true,
+		SeedImagesMode:     "release-pins",
+		SeedImageJobs:      4,
+		RefreshKubeconfig:  true,
+		ReadinessProfile:   defaultReadinessProfile,
+		TalosSubnet:        "10.6.0.0/24",
+		TalosWorkers:       2,
+		TalosControlMemory: "6GiB",
+		TalosWorkerMemory:  "6GiB",
+		TalosControlCPUs:   "4.0",
+		TalosWorkerCPUs:    "3.0",
+		TalosOIDCIssuerURL: "https://oidcissuer65846b7df97b.z13.web.core.windows.net/",
 		TalosExposedPorts: []string{
-			"8443:443/tcp",
+			"9443:443/tcp",
 		},
 	}
 }
@@ -202,6 +225,9 @@ func (o *options) validate() error {
 	} else if !st.IsDir() {
 		return fmt.Errorf("stacks repo %s is not a directory", o.StacksRepo)
 	}
+	if o.ReadinessProfile != "" && !filepath.IsAbs(o.ReadinessProfile) {
+		o.ReadinessProfile = filepath.Join(o.StacksRepo, o.ReadinessProfile)
+	}
 	if o.Overlay == "" {
 		return fmt.Errorf("--overlay is required")
 	}
@@ -220,7 +246,38 @@ func (o *options) validate() error {
 	if o.SeedImagesMode != "" && o.SeedImagesMode != "release-pins" {
 		return fmt.Errorf("unsupported --seed-images-mode %q; only release-pins is implemented", o.SeedImagesMode)
 	}
+	if o.SeedImageJobs < 1 {
+		return fmt.Errorf("--seed-image-jobs must be at least 1")
+	}
 	return nil
+}
+
+func (o *options) applyProviderDefaults(cmd *cobra.Command) {
+	if o.Provider == providerKind {
+		if !flagChanged(cmd, "overlay") && o.Overlay == defaultOverlay {
+			o.Overlay = defaultLegacyKindOverlay
+		}
+		if !flagChanged(cmd, "readiness-profile") && (o.ReadinessProfile == "" || o.ReadinessProfile == defaultReadinessProfile || o.ReadinessProfile == filepath.Join(o.StacksRepo, defaultReadinessProfile)) {
+			o.ReadinessProfile = filepath.Join(o.StacksRepo, defaultLegacyKindReadinessProfile)
+		}
+		return
+	}
+	if !flagChanged(cmd, "readiness-profile") && (o.ReadinessProfile == "" || o.ReadinessProfile == defaultReadinessProfile) {
+		o.ReadinessProfile = filepath.Join(o.StacksRepo, defaultReadinessProfile)
+	}
+}
+
+func flagChanged(cmd *cobra.Command, name string) bool {
+	if f := cmd.Flags().Lookup(name); f != nil {
+		return f.Changed
+	}
+	if f := cmd.InheritedFlags().Lookup(name); f != nil {
+		return f.Changed
+	}
+	if f := cmd.PersistentFlags().Lookup(name); f != nil {
+		return f.Changed
+	}
+	return false
 }
 
 func withStacksEnv(o *options, extra ...string) []string {

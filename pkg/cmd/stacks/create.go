@@ -50,7 +50,7 @@ func createKind(ctx context.Context, o *options) error {
 			return err
 		}
 		_ = withReadinessPhase(ctx, o, "tailscale-cleanup-post-delete", func() error {
-			cleanupTailscaleDevices(ctx, o, tailscaleCleanupWait)
+			cleanupTailscaleDevices(ctx, o, tailscaleCleanupWaitIfDeleted)
 			return nil
 		})
 		exists = false
@@ -93,13 +93,48 @@ func createKind(ctx context.Context, o *options) error {
 
 func createTalosDocker(ctx context.Context, o *options) error {
 	if o.Recreate {
+		if o.ClusterName == defaultClusterName {
+			_ = withReadinessPhase(ctx, o, "legacy-kind-delete", func() error {
+				deleteLegacyKindCluster(ctx, o, o.ClusterName)
+				return nil
+			})
+			_ = withReadinessPhase(ctx, o, "legacy-ryzen-talos-delete", func() error {
+				deleteLegacyTalosDockerCluster(ctx, o, "ryzen-talos")
+				return nil
+			})
+			_ = withReadinessPhase(ctx, o, "tailscale-cleanup-legacy-ryzen-talos", func() error {
+				legacy := *o
+				legacy.ClusterName = "ryzen-talos"
+				cleanupTailscaleDevices(ctx, &legacy, tailscaleCleanupWaitIfDeleted)
+				return nil
+			})
+		}
+		_ = withReadinessPhase(ctx, o, "tailscale-cleanup-pre-delete", func() error {
+			cleanupTailscaleDevices(ctx, o, tailscaleCleanupNoWait)
+			return nil
+		})
 		_ = withReadinessPhase(ctx, o, "talos-docker-delete", func() error {
-			return run(ctx, o.StacksRepo, withStacksEnv(o), "talosctl", "cluster", "destroy", "--name", o.ClusterName)
+			destroyTalosDockerCluster(ctx, o)
+			return nil
+		})
+		_ = withReadinessPhase(ctx, o, "tailscale-cleanup-post-delete", func() error {
+			cleanupTailscaleDevices(ctx, o, tailscaleCleanupWaitIfDeleted)
+			return nil
 		})
 	}
 	exists := talosClusterExists(ctx, o.ClusterName)
 	if !exists {
-		args, err := talosDockerCreateArgs(o)
+		_ = withReadinessPhase(ctx, o, "tailscale-cleanup-pre-create", func() error {
+			cleanupTailscaleDevices(ctx, o, tailscaleCleanupWaitIfDeleted)
+			return nil
+		})
+		cleanupTalosDockerKubeconfig(ctx, o)
+		talosOptions, cleanup, err := prepareTalosDockerOptions(o)
+		if err != nil {
+			return err
+		}
+		defer cleanup()
+		args, err := talosDockerCreateArgs(talosOptions)
 		if err != nil {
 			return err
 		}
@@ -110,6 +145,9 @@ func createTalosDocker(ctx context.Context, o *options) error {
 		}
 	} else {
 		fmt.Printf("Talos Docker cluster %q already exists; reconciling bootstrap and Git snapshot\n", o.ClusterName)
+	}
+	if err := useTalosDockerKubeContext(ctx, o); err != nil {
+		return err
 	}
 	return bootstrapStacksGitOps(ctx, o)
 }
@@ -213,16 +251,23 @@ func bootstrapStacksGitOps(ctx context.Context, o *options) error {
 
 func seedBootstrapImages(ctx context.Context, o *options) error {
 	script := filepath.Join(o.StacksRepo, "deployment", "scripts", "bootstrap", "seed-ryzen-images.sh")
-	args := []string{script, "--mode", "critical"}
+	args := []string{script, "--mode", "critical", "--jobs", fmt.Sprint(o.SeedImageJobs)}
 	if o.SeedImagesMode == "release-pins" {
 		args = append(args, "--pins", filepath.Join(o.StacksRepo, "packages", "components", "hub-spoke-appsets", "release-pins", "workflow-builder-images.yaml"))
 	}
-	return run(ctx, o.StacksRepo, withStacksEnv(o), "bash", args...)
+	env := withStacksEnv(o)
+	if o.Provider == providerTalosDocker {
+		env = append(env,
+			"DEST_REGISTRY="+talosDockerHostRegistry(o),
+			"GITEA_PORT_FORWARD=false",
+		)
+	}
+	return run(ctx, o.StacksRepo, env, "bash", args...)
 }
 
 func refreshRyzenKubeconfig(ctx context.Context, o *options) error {
 	script := filepath.Join(o.StacksRepo, "deployment", "scripts", "tailscale", "refresh-ryzen-kubeconfig.sh")
-	args := []string{script, "--cluster", o.ClusterName, "--service", o.ClusterName + "-k8s-api"}
+	args := []string{script, "--cluster", o.ClusterName}
 	if o.StrictAccess {
 		args = append(args, "--strict-remote-verify")
 	}
@@ -312,6 +357,111 @@ func kindClusterExists(ctx context.Context, name string) (bool, error) {
 }
 
 func talosClusterExists(ctx context.Context, name string) bool {
-	_, err := output(ctx, "", os.Environ(), "talosctl", "cluster", "show", "--name", name)
-	return err == nil
+	out, err := output(ctx, "", os.Environ(), "talosctl", "cluster", "show", "--name", name)
+	if err != nil {
+		return false
+	}
+	return talosClusterShowHasNodes(out)
+}
+
+func talosClusterShowHasNodes(out string) bool {
+	inNodes := false
+	for _, line := range strings.Split(out, "\n") {
+		line = strings.TrimSpace(line)
+		if line == "NODES:" {
+			inNodes = true
+			continue
+		}
+		if !inNodes || line == "" || strings.HasPrefix(line, "NAME ") {
+			continue
+		}
+		return true
+	}
+	return false
+}
+
+func destroyTalosDockerCluster(ctx context.Context, o *options) {
+	if err := run(ctx, o.StacksRepo, withStacksEnv(o), "talosctl", "cluster", "destroy", "--name", o.ClusterName); err != nil {
+		fmt.Fprintf(os.Stderr, "warning: Talos Docker destroy failed; removing stale local state for %s: %v\n", o.ClusterName, err)
+	}
+	_ = run(ctx, o.StacksRepo, withStacksEnv(o), "docker", "rm", "-f", o.ClusterName+"-controlplane-1")
+	for i := 1; i <= o.TalosWorkers; i++ {
+		_ = run(ctx, o.StacksRepo, withStacksEnv(o), "docker", "rm", "-f", fmt.Sprintf("%s-worker-%d", o.ClusterName, i))
+	}
+	_ = run(ctx, o.StacksRepo, withStacksEnv(o), "docker", "network", "rm", o.ClusterName)
+	if home, err := os.UserHomeDir(); err == nil {
+		_ = os.RemoveAll(filepath.Join(home, ".talos", "clusters", o.ClusterName))
+	}
+	cleanupTalosDockerKubeconfig(ctx, o)
+}
+
+func deleteLegacyKindCluster(ctx context.Context, o *options, name string) {
+	exists, err := kindClusterExists(ctx, name)
+	if err != nil || !exists {
+		return
+	}
+	fmt.Printf("Deleting legacy kind cluster %q before Talos Docker recreate\n", name)
+	if err := run(ctx, o.StacksRepo, withStacksEnv(o), "kind", "delete", "cluster", "--name", name); err != nil {
+		fmt.Fprintf(os.Stderr, "warning: legacy kind cluster delete failed for %s: %v\n", name, err)
+	}
+}
+
+func deleteLegacyTalosDockerCluster(ctx context.Context, o *options, name string) {
+	if name == "" || name == o.ClusterName || !talosClusterExists(ctx, name) {
+		return
+	}
+	fmt.Printf("Deleting legacy Talos Docker cluster %q before canonical %q recreate\n", name, o.ClusterName)
+	legacy := *o
+	legacy.ClusterName = name
+	destroyTalosDockerCluster(ctx, &legacy)
+}
+
+func useTalosDockerKubeContext(ctx context.Context, o *options) error {
+	contextName := "admin@" + o.ClusterName
+	if err := run(ctx, o.StacksRepo, withStacksEnv(o), "kubectl", "config", "use-context", contextName); err != nil {
+		return fmt.Errorf("switching kubectl to Talos Docker context %s: %w", contextName, err)
+	}
+	return nil
+}
+
+func cleanupTalosDockerKubeconfig(ctx context.Context, o *options) {
+	deleteKubectlConfigEntries(ctx, o, "get-contexts", "delete-context", func(name string) bool {
+		return talosDockerKubeconfigNameMatches(name, "admin@"+o.ClusterName)
+	})
+	deleteKubectlConfigEntries(ctx, o, "get-clusters", "delete-cluster", func(name string) bool {
+		return talosDockerKubeconfigNameMatches(name, o.ClusterName)
+	})
+	deleteKubectlConfigEntries(ctx, o, "get-users", "delete-user", func(name string) bool {
+		return talosDockerKubeconfigNameMatches(name, "admin@"+o.ClusterName)
+	})
+}
+
+func deleteKubectlConfigEntries(ctx context.Context, o *options, listCommand, deleteCommand string, match func(string) bool) {
+	out, err := output(ctx, o.StacksRepo, withStacksEnv(o), "kubectl", "config", listCommand)
+	if err != nil {
+		return
+	}
+	for _, line := range strings.Split(out, "\n") {
+		name := strings.TrimSpace(line)
+		if name == "" || name == "NAME" || !match(name) {
+			continue
+		}
+		_ = run(ctx, o.StacksRepo, withStacksEnv(o), "kubectl", "config", deleteCommand, name)
+	}
+}
+
+func talosDockerKubeconfigNameMatches(name, base string) bool {
+	if name == base {
+		return true
+	}
+	suffix, ok := strings.CutPrefix(name, base+"-")
+	if !ok || suffix == "" {
+		return false
+	}
+	for _, r := range suffix {
+		if r < '0' || r > '9' {
+			return false
+		}
+	}
+	return true
 }

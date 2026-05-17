@@ -2,10 +2,14 @@ package stacks
 
 import (
 	"bufio"
+	"encoding/base64"
+	"encoding/binary"
 	"fmt"
+	"net"
 	"os"
 	"path/filepath"
 	"regexp"
+	"strconv"
 	"strings"
 )
 
@@ -39,6 +43,10 @@ func talosDockerCreateArgs(o *options) ([]string, error) {
 		"--kubernetes-version", strings.TrimPrefix(kubeVersion, "v"),
 		"--image", talosImage,
 		"--subnet", o.TalosSubnet,
+		"--memory-controlplanes", o.TalosControlMemory,
+		"--memory-workers", o.TalosWorkerMemory,
+		"--cpus-controlplanes", o.TalosControlCPUs,
+		"--cpus-workers", o.TalosWorkerCPUs,
 	}
 	for _, port := range o.TalosExposedPorts {
 		if strings.TrimSpace(port) != "" {
@@ -56,6 +64,169 @@ func talosDockerCreateArgs(o *options) ([]string, error) {
 		}
 	}
 	return args, nil
+}
+
+func prepareTalosDockerOptions(o *options) (*options, func(), error) {
+	prepared := *o
+	cleanups := []func(){}
+	cleanup := func() {
+		for i := len(cleanups) - 1; i >= 0; i-- {
+			cleanups[i]()
+		}
+	}
+
+	if !hasValues(prepared.TalosMounts) {
+		mount, err := defaultTalosDockerLocalPathMount(&prepared)
+		if err != nil {
+			return nil, cleanup, err
+		}
+		prepared.TalosMounts = []string{mount}
+	}
+
+	patch, patchCleanup, err := renderTalosDockerBootstrapPatch(&prepared)
+	if err != nil {
+		return nil, cleanup, err
+	}
+	cleanups = append(cleanups, patchCleanup)
+	prepared.TalosConfigPatches = append([]string{"@" + patch}, prepared.TalosConfigPatches...)
+
+	return &prepared, cleanup, nil
+}
+
+func renderTalosDockerBootstrapPatch(o *options) (string, func(), error) {
+	controlPlaneIP, err := talosDockerControlPlaneIP(o.TalosSubnet)
+	if err != nil {
+		return "", nil, err
+	}
+	serviceAccountKey, err := talosDockerServiceAccountKey(o)
+	if err != nil {
+		return "", nil, err
+	}
+	issuerURL := strings.TrimSpace(o.TalosOIDCIssuerURL)
+	if issuerURL == "" {
+		return "", nil, fmt.Errorf("--talos-oidc-issuer-url is required")
+	}
+	content := fmt.Sprintf(`machine:
+  nodeLabels:
+    stacks.io/swebench-pool: dev-benchmark
+cluster:
+  apiServer:
+    extraArgs:
+      service-account-issuer: %s
+  serviceAccount:
+    key: %s
+---
+apiVersion: v1alpha1
+kind: RegistryMirrorConfig
+name: gitea.cnoe.localtest.me:8443
+endpoints:
+  - url: https://gitea.cnoe.localtest.me
+skipFallback: true
+---
+apiVersion: v1alpha1
+kind: RegistryMirrorConfig
+name: gitea.cnoe.localtest.me
+endpoints:
+  - url: https://gitea.cnoe.localtest.me
+skipFallback: true
+---
+apiVersion: v1alpha1
+kind: RegistryTLSConfig
+name: gitea.cnoe.localtest.me
+insecureSkipVerify: true
+---
+apiVersion: v1alpha1
+kind: RegistryAuthConfig
+name: gitea.cnoe.localtest.me
+username: %s
+password: %s
+---
+apiVersion: v1alpha1
+kind: StaticHostConfig
+name: %s
+hostnames:
+  - gitea.cnoe.localtest.me
+`, strconv.Quote(issuerURL), strconv.Quote(serviceAccountKey), strconv.Quote(o.GiteaUser), strconv.Quote(o.GiteaPassword), controlPlaneIP)
+	return writeTempYAML("idpbuilder-stacks-talos-docker-*.yaml", content)
+}
+
+func talosDockerServiceAccountKey(o *options) (string, error) {
+	keyPath := filepath.Join(o.StacksRepo, "ref-implementation", "azure-workload-identity", "keys", "sa.key")
+	raw, err := os.ReadFile(keyPath)
+	if err != nil {
+		return "", fmt.Errorf("reading Azure Workload Identity service-account signing key %s: %w", keyPath, err)
+	}
+	return base64.StdEncoding.EncodeToString(raw), nil
+}
+
+func defaultTalosDockerLocalPathMount(o *options) (string, error) {
+	stateHome := os.Getenv("XDG_STATE_HOME")
+	if stateHome == "" {
+		home, err := os.UserHomeDir()
+		if err != nil {
+			return "", fmt.Errorf("resolving home directory for Talos Docker mount: %w", err)
+		}
+		stateHome = filepath.Join(home, ".local", "state")
+	}
+	dir := filepath.Join(stateHome, "idpbuilder-stacks", o.ClusterName, "local-path-provisioner")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return "", fmt.Errorf("creating Talos Docker local-path mount %s: %w", dir, err)
+	}
+	return "type=bind,source=" + dir + ",target=/var/local-path-provisioner", nil
+}
+
+func talosDockerHostRegistry(o *options) string {
+	return fmt.Sprintf("gitea.cnoe.localtest.me:%s/%s", talosDockerHTTPSHostPort(o), o.GiteaOwner)
+}
+
+func talosDockerHTTPSHostPort(o *options) string {
+	for _, port := range o.TalosExposedPorts {
+		port = strings.TrimSpace(port)
+		if port == "" {
+			continue
+		}
+		hostPort, containerSpec, ok := strings.Cut(port, ":")
+		if !ok || hostPort == "" {
+			continue
+		}
+		containerPort, protocol, _ := strings.Cut(containerSpec, "/")
+		if containerPort == "443" && (protocol == "" || protocol == "tcp") {
+			return hostPort
+		}
+	}
+	return "9443"
+}
+
+func talosDockerControlPlaneIP(subnet string) (string, error) {
+	ip, network, err := net.ParseCIDR(subnet)
+	if err != nil {
+		return "", fmt.Errorf("parsing --talos-subnet %q: %w", subnet, err)
+	}
+	ip = ip.To4()
+	if ip == nil {
+		return "", fmt.Errorf("--talos-subnet %q must be an IPv4 CIDR", subnet)
+	}
+	ones, bits := network.Mask.Size()
+	if bits != 32 || ones > 30 {
+		return "", fmt.Errorf("--talos-subnet %q must have at least two usable IPv4 addresses", subnet)
+	}
+	value := binary.BigEndian.Uint32(ip)
+	value += 2
+	out := make(net.IP, net.IPv4len)
+	binary.BigEndian.PutUint32(out, value)
+	if !network.Contains(out) {
+		return "", fmt.Errorf("derived Talos Docker control-plane IP %s is outside subnet %s", out, subnet)
+	}
+	return out.String(), nil
+}
+
+func hasValues(values []string) bool {
+	for _, value := range values {
+		if strings.TrimSpace(value) != "" {
+			return true
+		}
+	}
+	return false
 }
 
 func detectTalosVersions(stacksRepo string) (talosVersion, kubeVersion string, err error) {
