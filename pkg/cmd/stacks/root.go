@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/cnoe-io/idpbuilder/pkg/cmd/helpers"
@@ -15,6 +16,14 @@ import (
 const (
 	providerKind        = "kind"
 	providerTalosDocker = "talos-docker"
+
+	containerEngineAuto   = "auto"
+	containerEngineDocker = "docker"
+	containerEnginePodman = "podman"
+
+	seedImagePushEngineAuto   = "auto"
+	seedImagePushEngineDocker = "docker"
+	seedImagePushEngineSkopeo = "skopeo"
 
 	waitTargetBootstrap     = "bootstrap"
 	waitTargetGitOpsCore    = "gitops-core"
@@ -48,18 +57,20 @@ type options struct {
 	WatchInterval time.Duration
 	Recreate      bool
 
-	SkipAzureCheck     bool
-	SkipArgocdInit     bool
-	SkipTektonBuild    bool
-	SeedImages         bool
-	SeedImagesMode     string
-	SeedImageJobs      int
-	RefreshKubeconfig  bool
-	PushKubeconfigHost string
-	EnforceSLO         bool
-	StrictAccess       bool
-	ReadinessProfile   string
-	WaitTarget         string
+	SkipAzureCheck      bool
+	SkipArgocdInit      bool
+	SkipTektonBuild     bool
+	SeedImages          bool
+	SeedImagesMode      string
+	SeedImageJobs       int
+	SeedImagePushEngine string
+	ContainerEngine     string
+	RefreshKubeconfig   bool
+	PushKubeconfigHost  string
+	EnforceSLO          bool
+	StrictAccess        bool
+	ReadinessProfile    string
+	WaitTarget          string
 
 	RewriteBootstrapImagePins bool
 
@@ -132,6 +143,8 @@ func newStacksCmd() *cobra.Command {
 	createCmd.Flags().BoolVar(&opts.SeedImages, "seed-images", true, "seed ryzen bootstrap images from release pins into local Gitea")
 	createCmd.Flags().StringVar(&opts.SeedImagesMode, "seed-images-mode", "release-pins", "bootstrap image seed mode; only release-pins is supported")
 	createCmd.Flags().IntVar(&opts.SeedImageJobs, "seed-image-jobs", opts.SeedImageJobs, "number of ryzen bootstrap images to seed concurrently")
+	createCmd.Flags().StringVar(&opts.SeedImagePushEngine, "seed-image-push-engine", opts.SeedImagePushEngine, "image push engine for bootstrap seeding: auto, docker, or skopeo")
+	createCmd.Flags().StringVar(&opts.ContainerEngine, "container-engine", opts.ContainerEngine, "container engine for stacks provider cleanup: auto, docker, or podman")
 	createCmd.Flags().BoolVar(&opts.RefreshKubeconfig, "refresh-kubeconfig", true, "refresh local kubeconfig after create")
 	createCmd.Flags().StringVar(&opts.PushKubeconfigHost, "push-kubeconfig-host", "", "optional SSH host to receive refreshed Tailscale kubeconfig")
 	createCmd.Flags().BoolVar(&opts.EnforceSLO, "enforce-slo", false, "fail when recreate timings regress beyond the readiness baseline")
@@ -188,32 +201,34 @@ func defaultOptions() *options {
 		}
 	}
 	return &options{
-		Profile:            defaultProfile,
-		Provider:           providerTalosDocker,
-		StacksRepo:         stacksRepo,
-		Overlay:            defaultOverlay,
-		Branch:             defaultBranch,
-		ClusterName:        defaultClusterName,
-		GiteaOwner:         defaultGiteaUser,
-		GiteaRepo:          "stacks",
-		GiteaUser:          defaultGiteaUser,
-		GiteaPassword:      defaultGiteaPass,
-		WatchInterval:      3 * time.Second,
-		SkipAzureCheck:     true,
-		SkipTektonBuild:    true,
-		SeedImages:         true,
-		SeedImagesMode:     "release-pins",
-		SeedImageJobs:      6,
-		RefreshKubeconfig:  true,
-		ReadinessProfile:   defaultReadinessProfile,
-		WaitTarget:         waitTargetInnerLoop,
-		TalosSubnet:        "10.6.0.0/24",
-		TalosWorkers:       2,
-		TalosControlMemory: "6GiB",
-		TalosWorkerMemory:  "6GiB",
-		TalosControlCPUs:   "4.0",
-		TalosWorkerCPUs:    "3.0",
-		TalosOIDCIssuerURL: "https://oidcissuer65846b7df97b.z13.web.core.windows.net/",
+		Profile:             defaultProfile,
+		Provider:            providerTalosDocker,
+		StacksRepo:          stacksRepo,
+		Overlay:             defaultOverlay,
+		Branch:              defaultBranch,
+		ClusterName:         defaultClusterName,
+		GiteaOwner:          defaultGiteaUser,
+		GiteaRepo:           "stacks",
+		GiteaUser:           defaultGiteaUser,
+		GiteaPassword:       defaultGiteaPass,
+		WatchInterval:       3 * time.Second,
+		SkipAzureCheck:      true,
+		SkipTektonBuild:     true,
+		SeedImages:          true,
+		SeedImagesMode:      "release-pins",
+		SeedImageJobs:       6,
+		SeedImagePushEngine: envOrDefault("IDPBUILDER_STACKS_SEED_IMAGE_PUSH_ENGINE", seedImagePushEngineAuto),
+		ContainerEngine:     envOrDefault("IDPBUILDER_STACKS_CONTAINER_ENGINE", containerEngineAuto),
+		RefreshKubeconfig:   true,
+		ReadinessProfile:    defaultReadinessProfile,
+		WaitTarget:          waitTargetInnerLoop,
+		TalosSubnet:         "10.6.0.0/24",
+		TalosWorkers:        2,
+		TalosControlMemory:  "6GiB",
+		TalosWorkerMemory:   "6GiB",
+		TalosControlCPUs:    "4.0",
+		TalosWorkerCPUs:     "3.0",
+		TalosOIDCIssuerURL:  "https://oidcissuer65846b7df97b.z13.web.core.windows.net/",
 		TalosExposedPorts: []string{
 			"9443:443/tcp",
 		},
@@ -264,6 +279,12 @@ func (o *options) validate() error {
 	if o.SeedImageJobs < 1 {
 		return fmt.Errorf("--seed-image-jobs must be at least 1")
 	}
+	if !validContainerEngine(o.ContainerEngine) {
+		return fmt.Errorf("unsupported --container-engine %q; expected auto, docker, or podman", o.ContainerEngine)
+	}
+	if !validSeedImagePushEngine(o.SeedImagePushEngine) {
+		return fmt.Errorf("unsupported --seed-image-push-engine %q; expected auto, docker, or skopeo", o.SeedImagePushEngine)
+	}
 	if !validWaitTarget(o.WaitTarget) {
 		return fmt.Errorf("unsupported --wait-target %q; expected bootstrap, gitops-core, inner-loop, observability, or all", o.WaitTarget)
 	}
@@ -289,6 +310,11 @@ func (o *options) applyProviderDefaults(cmd *cobra.Command) {
 	if !flagChanged(cmd, "readiness-profile") && (o.ReadinessProfile == "" || o.ReadinessProfile == defaultReadinessProfile) {
 		o.ReadinessProfile = filepath.Join(o.StacksRepo, defaultReadinessProfile)
 	}
+	if !flagChanged(cmd, "seed-image-jobs") && o.SeedImagePushEngine == seedImagePushEngineSkopeo {
+		// Fresh in-cluster Gitea registry writes are fragile under parallel
+		// skopeo uploads; keep Dockerless bootstrap deterministic by default.
+		o.SeedImageJobs = 1
+	}
 }
 
 func validWaitTarget(target string) bool {
@@ -308,6 +334,31 @@ func waitCohortsThrough(target string) []string {
 		}
 	}
 	return cohorts
+}
+
+func validContainerEngine(engine string) bool {
+	switch engine {
+	case containerEngineAuto, containerEngineDocker, containerEnginePodman:
+		return true
+	default:
+		return false
+	}
+}
+
+func validSeedImagePushEngine(engine string) bool {
+	switch engine {
+	case seedImagePushEngineAuto, seedImagePushEngineDocker, seedImagePushEngineSkopeo:
+		return true
+	default:
+		return false
+	}
+}
+
+func envOrDefault(key, fallback string) string {
+	if value := strings.TrimSpace(os.Getenv(key)); value != "" {
+		return value
+	}
+	return fallback
 }
 
 func flagChanged(cmd *cobra.Command, name string) bool {

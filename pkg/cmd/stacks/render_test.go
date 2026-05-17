@@ -108,8 +108,11 @@ func TestTalosDockerBootstrapPatch(t *testing.T) {
 	got := string(raw)
 	for _, want := range []string{
 		"kind: RegistryMirrorConfig",
+		"name: gitea.cnoe.localtest.me:9443",
 		"name: gitea.cnoe.localtest.me:8443",
 		"- url: https://gitea.cnoe.localtest.me",
+		"name: docker.io",
+		"- url: https://mirror.gcr.io",
 		"service-account-issuer: \"https://oidcissuer65846b7df97b.z13.web.core.windows.net/\"",
 		"serviceAccount:",
 		"key: \"dGVzdC1zaWduaW5nLWtleQ==\"",
@@ -118,6 +121,8 @@ func TestTalosDockerBootstrapPatch(t *testing.T) {
 		"kind: StaticHostConfig",
 		"name: 10.6.0.2",
 		"stacks.io/swebench-pool: dev-benchmark",
+		"nameservers:",
+		"- 10.6.0.1",
 	} {
 		if !strings.Contains(got, want) {
 			t.Fatalf("patch missing %q: %s", want, got)
@@ -143,6 +148,18 @@ func TestTalosDockerProviderDefaults(t *testing.T) {
 	}
 	if o.WaitTarget != waitTargetInnerLoop {
 		t.Fatalf("wait target = %q, want %q", o.WaitTarget, waitTargetInnerLoop)
+	}
+}
+
+func TestTalosDockerSkopeoProviderDefaultsUseSerialImageSeeding(t *testing.T) {
+	repo := t.TempDir()
+	o := defaultOptions()
+	o.Provider = providerTalosDocker
+	o.StacksRepo = repo
+	o.SeedImagePushEngine = seedImagePushEngineSkopeo
+	o.applyProviderDefaults(&cobra.Command{})
+	if o.SeedImageJobs != 1 {
+		t.Fatalf("seed image jobs = %d, want 1", o.SeedImageJobs)
 	}
 }
 
@@ -218,6 +235,15 @@ func TestTalosDockerHostRegistryUsesExposedHTTPSPort(t *testing.T) {
 	o.TalosExposedPorts = []string{"10443:443/tcp"}
 	if got, want := talosDockerHostRegistry(o), "gitea.cnoe.localtest.me:10443/giteaadmin"; got != want {
 		t.Fatalf("host registry = %q, want %q", got, want)
+	}
+}
+
+func TestBootstrapImageRewriteRegistryUsesTalosHostPort(t *testing.T) {
+	o := defaultOptions()
+	o.Provider = providerTalosDocker
+	o.GiteaOwner = "giteaadmin"
+	if got, want := bootstrapImageRewriteRegistry(o), "gitea.cnoe.localtest.me:9443/giteaadmin"; got != want {
+		t.Fatalf("rewrite registry = %q, want %q", got, want)
 	}
 }
 

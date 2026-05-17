@@ -255,7 +255,7 @@ func rewriteBootstrapImagePins(ctx context.Context, o *options, snapshotDir stri
 		script,
 		"--mode", "critical",
 		"--rewrite-kustomizations", snapshotDir,
-		"--rewrite-registry", fmt.Sprintf("gitea.cnoe.localtest.me/%s", o.GiteaOwner),
+		"--rewrite-registry", bootstrapImageRewriteRegistry(o),
 		"--skip-copy",
 		"--quiet",
 	}
@@ -266,6 +266,13 @@ func rewriteBootstrapImagePins(ctx context.Context, o *options, snapshotDir stri
 		return fmt.Errorf("rewriting bootstrap image pins: %w", err)
 	}
 	return nil
+}
+
+func bootstrapImageRewriteRegistry(o *options) string {
+	if o.Provider == providerTalosDocker {
+		return talosDockerHostRegistry(o)
+	}
+	return fmt.Sprintf("gitea.cnoe.localtest.me/%s", o.GiteaOwner)
 }
 
 func giteaRemoteURL(port int, o *options) string {

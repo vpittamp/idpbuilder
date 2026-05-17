@@ -93,6 +93,9 @@ func createKind(ctx context.Context, o *options) error {
 }
 
 func createTalosDocker(ctx context.Context, o *options) (err error) {
+	if err := preflightTalosContainerEngine(ctx, o); err != nil {
+		return err
+	}
 	var postDeleteCleanup *asyncReadinessPhase
 	defer func() {
 		if err != nil && postDeleteCleanup != nil {
@@ -280,9 +283,15 @@ func seedBootstrapImages(ctx context.Context, o *options) error {
 	if o.Provider == providerTalosDocker {
 		env = append(env,
 			"DEST_REGISTRY="+talosDockerHostRegistry(o),
+			"DEST_TLS_VERIFY=false",
 			"GITEA_PORT_FORWARD=false",
 		)
 	}
+	pushEngine, err := resolveSeedImagePushEngine(o)
+	if err != nil {
+		return err
+	}
+	env = append(env, "PUSH_ENGINE="+pushEngine)
 	return run(ctx, o.StacksRepo, env, "bash", args...)
 }
 
@@ -437,11 +446,14 @@ func destroyTalosDockerCluster(ctx context.Context, o *options) {
 	if err := run(ctx, o.StacksRepo, withStacksEnv(o), "talosctl", "cluster", "destroy", "--name", o.ClusterName); err != nil {
 		fmt.Fprintf(os.Stderr, "warning: Talos Docker destroy failed; removing stale local state for %s: %v\n", o.ClusterName, err)
 	}
-	_ = run(ctx, o.StacksRepo, withStacksEnv(o), "docker", "rm", "-f", o.ClusterName+"-controlplane-1")
-	for i := 1; i <= o.TalosWorkers; i++ {
-		_ = run(ctx, o.StacksRepo, withStacksEnv(o), "docker", "rm", "-f", fmt.Sprintf("%s-worker-%d", o.ClusterName, i))
+	cleanupCommands, err := talosDockerCleanupCommands(o)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "warning: Talos Docker stale local cleanup skipped for %s: %v\n", o.ClusterName, err)
+	} else {
+		for _, cmd := range cleanupCommands {
+			_ = run(ctx, o.StacksRepo, withStacksEnv(o), cmd.name, cmd.args...)
+		}
 	}
-	_ = run(ctx, o.StacksRepo, withStacksEnv(o), "docker", "network", "rm", o.ClusterName)
 	if home, err := os.UserHomeDir(); err == nil {
 		_ = os.RemoveAll(filepath.Join(home, ".talos", "clusters", o.ClusterName))
 	}

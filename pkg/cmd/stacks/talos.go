@@ -98,6 +98,22 @@ func renderTalosDockerBootstrapPatch(o *options) (string, func(), error) {
 	if err != nil {
 		return "", nil, err
 	}
+	gatewayIP, err := talosDockerGatewayIP(o.TalosSubnet)
+	if err != nil {
+		return "", nil, err
+	}
+	hostPort := talosDockerHTTPSHostPort(o)
+	legacyPortMirror := ""
+	if hostPort != "8443" {
+		legacyPortMirror = `---
+apiVersion: v1alpha1
+kind: RegistryMirrorConfig
+name: gitea.cnoe.localtest.me:8443
+endpoints:
+  - url: https://gitea.cnoe.localtest.me
+skipFallback: true
+`
+	}
 	serviceAccountKey, err := talosDockerServiceAccountKey(o)
 	if err != nil {
 		return "", nil, err
@@ -109,6 +125,9 @@ func renderTalosDockerBootstrapPatch(o *options) (string, func(), error) {
 	content := fmt.Sprintf(`machine:
   nodeLabels:
     stacks.io/swebench-pool: dev-benchmark
+  network:
+    nameservers:
+      - %s
 cluster:
   apiServer:
     extraArgs:
@@ -118,17 +137,23 @@ cluster:
 ---
 apiVersion: v1alpha1
 kind: RegistryMirrorConfig
-name: gitea.cnoe.localtest.me:8443
+name: gitea.cnoe.localtest.me:%s
 endpoints:
   - url: https://gitea.cnoe.localtest.me
 skipFallback: true
----
+%s---
 apiVersion: v1alpha1
 kind: RegistryMirrorConfig
 name: gitea.cnoe.localtest.me
 endpoints:
   - url: https://gitea.cnoe.localtest.me
 skipFallback: true
+---
+apiVersion: v1alpha1
+kind: RegistryMirrorConfig
+name: docker.io
+endpoints:
+  - url: https://mirror.gcr.io
 ---
 apiVersion: v1alpha1
 kind: RegistryTLSConfig
@@ -146,7 +171,7 @@ kind: StaticHostConfig
 name: %s
 hostnames:
   - gitea.cnoe.localtest.me
-`, strconv.Quote(issuerURL), strconv.Quote(serviceAccountKey), strconv.Quote(o.GiteaUser), strconv.Quote(o.GiteaPassword), controlPlaneIP)
+`, gatewayIP, strconv.Quote(issuerURL), strconv.Quote(serviceAccountKey), hostPort, legacyPortMirror, strconv.Quote(o.GiteaUser), strconv.Quote(o.GiteaPassword), controlPlaneIP)
 	return writeTempYAML("idpbuilder-stacks-talos-docker-*.yaml", content)
 }
 
@@ -198,6 +223,14 @@ func talosDockerHTTPSHostPort(o *options) string {
 }
 
 func talosDockerControlPlaneIP(subnet string) (string, error) {
+	return talosDockerSubnetIP(subnet, 2, "control-plane")
+}
+
+func talosDockerGatewayIP(subnet string) (string, error) {
+	return talosDockerSubnetIP(subnet, 1, "gateway")
+}
+
+func talosDockerSubnetIP(subnet string, offset uint32, name string) (string, error) {
 	ip, network, err := net.ParseCIDR(subnet)
 	if err != nil {
 		return "", fmt.Errorf("parsing --talos-subnet %q: %w", subnet, err)
@@ -211,11 +244,11 @@ func talosDockerControlPlaneIP(subnet string) (string, error) {
 		return "", fmt.Errorf("--talos-subnet %q must have at least two usable IPv4 addresses", subnet)
 	}
 	value := binary.BigEndian.Uint32(ip)
-	value += 2
+	value += offset
 	out := make(net.IP, net.IPv4len)
 	binary.BigEndian.PutUint32(out, value)
 	if !network.Contains(out) {
-		return "", fmt.Errorf("derived Talos Docker control-plane IP %s is outside subnet %s", out, subnet)
+		return "", fmt.Errorf("derived Talos Docker %s IP %s is outside subnet %s", name, out, subnet)
 	}
 	return out.String(), nil
 }
