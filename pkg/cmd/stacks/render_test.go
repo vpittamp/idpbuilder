@@ -141,6 +141,9 @@ func TestTalosDockerProviderDefaults(t *testing.T) {
 	if o.ReadinessProfile != wantProfile {
 		t.Fatalf("readiness profile = %q, want %q", o.ReadinessProfile, wantProfile)
 	}
+	if o.WaitTarget != waitTargetInnerLoop {
+		t.Fatalf("wait target = %q, want %q", o.WaitTarget, waitTargetInnerLoop)
+	}
 }
 
 func TestKindProviderDefaultsRemainLegacyKind(t *testing.T) {
@@ -158,6 +161,26 @@ func TestKindProviderDefaultsRemainLegacyKind(t *testing.T) {
 	wantProfile := filepath.Join(repo, defaultLegacyKindReadinessProfile)
 	if o.ReadinessProfile != wantProfile {
 		t.Fatalf("readiness profile = %q, want %q", o.ReadinessProfile, wantProfile)
+	}
+	if o.WaitTarget != waitTargetAll {
+		t.Fatalf("wait target = %q, want %q", o.WaitTarget, waitTargetAll)
+	}
+	if o.SeedImageJobs != 4 {
+		t.Fatalf("seed image jobs = %d, want 4", o.SeedImageJobs)
+	}
+}
+
+func TestWaitCohortsThrough(t *testing.T) {
+	got := waitCohortsThrough(waitTargetInnerLoop)
+	want := []string{waitTargetBootstrap, waitTargetGitOpsCore, waitTargetInnerLoop}
+	if strings.Join(got, ",") != strings.Join(want, ",") {
+		t.Fatalf("cohorts = %v, want %v", got, want)
+	}
+	if !validWaitTarget(waitTargetAll) {
+		t.Fatalf("expected %q to be a valid wait target", waitTargetAll)
+	}
+	if validWaitTarget("access") {
+		t.Fatalf("access should not be a blocking wait target")
 	}
 }
 

@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	syncpkg "sync"
 	"time"
 )
 
@@ -88,10 +89,16 @@ func createKind(ctx context.Context, o *options) error {
 		fmt.Printf("Kind cluster %q already exists; reconciling bootstrap and Git snapshot\n", o.ClusterName)
 	}
 
-	return bootstrapStacksGitOps(ctx, o)
+	return bootstrapStacksGitOps(ctx, o, nil)
 }
 
-func createTalosDocker(ctx context.Context, o *options) error {
+func createTalosDocker(ctx context.Context, o *options) (err error) {
+	var postDeleteCleanup *asyncReadinessPhase
+	defer func() {
+		if err != nil && postDeleteCleanup != nil {
+			_ = waitForAsyncTailscaleCleanup(postDeleteCleanup, o)
+		}
+	}()
 	if o.Recreate {
 		if o.ClusterName == defaultClusterName {
 			_ = withReadinessPhase(ctx, o, "legacy-kind-delete", func() error {
@@ -117,17 +124,18 @@ func createTalosDocker(ctx context.Context, o *options) error {
 			destroyTalosDockerCluster(ctx, o)
 			return nil
 		})
-		_ = withReadinessPhase(ctx, o, "tailscale-cleanup-post-delete", func() error {
-			cleanupTailscaleDevices(ctx, o, tailscaleCleanupWaitIfDeleted)
-			return nil
+		postDeleteCleanup = startAsyncReadinessPhase(ctx, o, "tailscale-cleanup-post-delete", func() error {
+			return cleanupTailscaleDevices(ctx, o, tailscaleCleanupWaitIfDeleted)
 		})
 	}
 	exists := talosClusterExists(ctx, o.ClusterName)
 	if !exists {
-		_ = withReadinessPhase(ctx, o, "tailscale-cleanup-pre-create", func() error {
-			cleanupTailscaleDevices(ctx, o, tailscaleCleanupWaitIfDeleted)
-			return nil
-		})
+		if postDeleteCleanup == nil {
+			_ = withReadinessPhase(ctx, o, "tailscale-cleanup-pre-create", func() error {
+				cleanupTailscaleDevices(ctx, o, tailscaleCleanupWaitIfDeleted)
+				return nil
+			})
+		}
 		cleanupTalosDockerKubeconfig(ctx, o)
 		talosOptions, cleanup, err := prepareTalosDockerOptions(o)
 		if err != nil {
@@ -149,10 +157,10 @@ func createTalosDocker(ctx context.Context, o *options) error {
 	if err := useTalosDockerKubeContext(ctx, o); err != nil {
 		return err
 	}
-	return bootstrapStacksGitOps(ctx, o)
+	return bootstrapStacksGitOps(ctx, o, postDeleteCleanup)
 }
 
-func bootstrapStacksGitOps(ctx context.Context, o *options) error {
+func bootstrapStacksGitOps(ctx context.Context, o *options, postDeleteCleanup *asyncReadinessPhase) error {
 	env := withStacksEnv(o)
 	if o.Provider == providerTalosDocker {
 		// bootstrap-local-infra.sh uses CLUSTER_HOST only for kind-node registry
@@ -200,6 +208,9 @@ func bootstrapStacksGitOps(ctx context.Context, o *options) error {
 		return err
 	}
 	defer cleanup()
+	if err := waitForAsyncTailscaleCleanup(postDeleteCleanup, o); err != nil {
+		return err
+	}
 	if err := withReadinessPhase(ctx, o, "apply-root-app", func() error {
 		return run(ctx, o.StacksRepo, env, "kubectl", "apply", "-f", bootstrapFile)
 	}); err != nil {
@@ -216,7 +227,7 @@ func bootstrapStacksGitOps(ctx context.Context, o *options) error {
 			return run(ctx, o.StacksRepo, authEnv, "bash", "-lc", fmt.Sprintf("source %q && sleep 2 && argocd-auth-init && sync-manual-apps", filepath.Join(o.StacksRepo, "deployment", "scripts", "cluster-menu.sh")))
 		})
 	}
-	for _, cohort := range []string{"bootstrap", "gitops-core", "inner-loop", "observability", "all"} {
+	for _, cohort := range waitCohortsThrough(o.WaitTarget) {
 		if err := withReadinessPhase(ctx, o, "wait-"+cohort, func() error {
 			return waitReadinessCohort(ctx, o, cohort)
 		}); err != nil {
@@ -270,6 +281,8 @@ func refreshRyzenKubeconfig(ctx context.Context, o *options) error {
 	args := []string{script, "--cluster", o.ClusterName}
 	if o.StrictAccess {
 		args = append(args, "--strict-remote-verify")
+	} else {
+		args = append(args, "--remote-verify-timeout", "5s")
 	}
 	if o.PushKubeconfigHost != "" {
 		args = append(args, "--push-host", o.PushKubeconfigHost)
@@ -293,9 +306,7 @@ func ensureArgoRepoSecret(ctx context.Context, o *options) error {
 	if err != nil {
 		return err
 	}
-	cmd := commandWithStdin(ctx, o.StacksRepo, withStacksEnv(o), "kubectl", "apply", "-f", "-")
-	cmd.Stdin = strings.NewReader(out)
-	if err := cmd.Run(); err != nil {
+	if err := runWithStdin(ctx, o.StacksRepo, withStacksEnv(o), strings.NewReader(out), "kubectl", "apply", "-f", "-"); err != nil {
 		return fmt.Errorf("applying argocd repository secret: %w", err)
 	}
 	if err := run(ctx, o.StacksRepo, withStacksEnv(o), "kubectl", "label", "secret", "repo-stacks-internal", "-n", "argocd", "argocd.argoproj.io/secret-type=repository", "--overwrite"); err != nil {
@@ -319,10 +330,10 @@ const (
 	tailscaleCleanupWaitIfDeleted tailscaleCleanupWaitMode = "--wait-if-deleted"
 )
 
-func cleanupTailscaleDevices(ctx context.Context, o *options, waitMode tailscaleCleanupWaitMode) {
+func cleanupTailscaleDevices(ctx context.Context, o *options, waitMode tailscaleCleanupWaitMode) error {
 	script := filepath.Join(o.StacksRepo, "deployment", "scripts", "tailscale", "cleanup-old-devices.sh")
 	if _, err := os.Stat(script); err != nil {
-		return
+		return nil
 	}
 	args := []string{script, "--cluster", o.ClusterName}
 	if waitMode != tailscaleCleanupNoWait {
@@ -330,7 +341,39 @@ func cleanupTailscaleDevices(ctx context.Context, o *options, waitMode tailscale
 	}
 	if err := run(ctx, o.StacksRepo, withStacksEnv(o), "bash", args...); err != nil {
 		fmt.Fprintf(os.Stderr, "warning: Tailscale cleanup failed: %v\n", err)
+		return err
 	}
+	return nil
+}
+
+type asyncReadinessPhase struct {
+	done     chan error
+	waitOnce syncpkg.Once
+	err      error
+}
+
+func startAsyncReadinessPhase(ctx context.Context, o *options, phase string, fn func() error) *asyncReadinessPhase {
+	async := &asyncReadinessPhase{done: make(chan error, 1)}
+	go func() {
+		async.done <- withReadinessPhase(ctx, o, phase, fn)
+	}()
+	return async
+}
+
+func waitForAsyncTailscaleCleanup(async *asyncReadinessPhase, o *options) error {
+	if async == nil {
+		return nil
+	}
+	async.waitOnce.Do(func() {
+		async.err = <-async.done
+	})
+	if err := async.err; err != nil {
+		if o.StrictAccess {
+			return fmt.Errorf("tailscale cleanup before root application: %w", err)
+		}
+		fmt.Fprintf(os.Stderr, "warning: Tailscale cleanup did not complete cleanly before root application; continuing in non-strict mode: %v\n", err)
+	}
+	return nil
 }
 
 func preloadTailscaleImages(ctx context.Context, o *options) {

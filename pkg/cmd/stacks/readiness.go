@@ -32,9 +32,11 @@ func markReadinessPhase(ctx context.Context, o *options, phase, edge string) {
 }
 
 func withReadinessPhase(ctx context.Context, o *options, phase string, fn func() error) error {
+	ctx, span, start := stacksTelemetry.startPhase(ctx, o, phase)
 	markReadinessPhase(ctx, o, phase, "start")
 	err := fn()
 	markReadinessPhase(ctx, o, phase, "end")
+	stacksTelemetry.endPhase(ctx, o, phase, start, span, err)
 	return err
 }
 

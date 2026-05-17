@@ -16,6 +16,12 @@ const (
 	providerKind        = "kind"
 	providerTalosDocker = "talos-docker"
 
+	waitTargetBootstrap     = "bootstrap"
+	waitTargetGitOpsCore    = "gitops-core"
+	waitTargetInnerLoop     = "inner-loop"
+	waitTargetObservability = "observability"
+	waitTargetAll           = "all"
+
 	defaultProfile                    = "ryzen"
 	defaultOverlay                    = "packages/overlays/ryzen"
 	defaultLegacyKindOverlay          = "packages/overlays/kind-ryzen"
@@ -53,6 +59,7 @@ type options struct {
 	EnforceSLO         bool
 	StrictAccess       bool
 	ReadinessProfile   string
+	WaitTarget         string
 
 	RewriteBootstrapImagePins bool
 
@@ -105,13 +112,15 @@ func newStacksCmd() *cobra.Command {
 		Use:   "create",
 		Short: "Create or reconcile a stacks local cluster",
 		RunE: func(cmd *cobra.Command, args []string) error {
-			if err := create(cmd.Context(), opts); err != nil {
-				return err
-			}
-			if opts.Watch {
-				return watchAndSync(cmd.Context(), opts)
-			}
-			return nil
+			return runStacksCommand(cmd.Context(), opts, "create", func(ctx context.Context) error {
+				if err := create(ctx, opts); err != nil {
+					return err
+				}
+				if opts.Watch {
+					return watchAndSync(ctx, opts)
+				}
+				return nil
+			})
 		},
 	}
 	createCmd.Flags().BoolVar(&opts.Recreate, "recreate", false, "delete and recreate the local cluster")
@@ -122,12 +131,13 @@ func newStacksCmd() *cobra.Command {
 	createCmd.Flags().BoolVar(&opts.SkipTektonBuild, "skip-tekton-builds", true, "skip background Tekton image build triggers")
 	createCmd.Flags().BoolVar(&opts.SeedImages, "seed-images", true, "seed ryzen bootstrap images from release pins into local Gitea")
 	createCmd.Flags().StringVar(&opts.SeedImagesMode, "seed-images-mode", "release-pins", "bootstrap image seed mode; only release-pins is supported")
-	createCmd.Flags().IntVar(&opts.SeedImageJobs, "seed-image-jobs", 4, "number of ryzen bootstrap images to seed concurrently")
+	createCmd.Flags().IntVar(&opts.SeedImageJobs, "seed-image-jobs", opts.SeedImageJobs, "number of ryzen bootstrap images to seed concurrently")
 	createCmd.Flags().BoolVar(&opts.RefreshKubeconfig, "refresh-kubeconfig", true, "refresh local kubeconfig after create")
 	createCmd.Flags().StringVar(&opts.PushKubeconfigHost, "push-kubeconfig-host", "", "optional SSH host to receive refreshed Tailscale kubeconfig")
 	createCmd.Flags().BoolVar(&opts.EnforceSLO, "enforce-slo", false, "fail when recreate timings regress beyond the readiness baseline")
 	createCmd.Flags().BoolVar(&opts.StrictAccess, "strict-access", false, "fail create when the remote Tailscale access cohort is not ready")
 	createCmd.Flags().StringVar(&opts.ReadinessProfile, "readiness-profile", "", "cluster readiness profile path")
+	createCmd.Flags().StringVar(&opts.WaitTarget, "wait-target", opts.WaitTarget, "last readiness cohort to block on: bootstrap, gitops-core, inner-loop, observability, or all")
 	createCmd.Flags().StringVar(&opts.KubeVersion, "kube-version", "", "Kubernetes version for talos-docker; default is read from the dev Talos claim")
 	createCmd.Flags().StringVar(&opts.TalosImage, "talos-image", "", "Talos image for talos-docker; default is read from the dev Talos claim")
 	createCmd.Flags().StringVar(&opts.TalosSubnet, "talos-subnet", "10.6.0.0/24", "Docker subnet for talos-docker")
@@ -145,10 +155,12 @@ func newStacksCmd() *cobra.Command {
 		Use:   "sync",
 		Short: "Snapshot the local stacks worktree into in-cluster Gitea",
 		RunE: func(cmd *cobra.Command, args []string) error {
-			syncOptions := *opts
-			syncOptions.RewriteBootstrapImagePins = opts.SeedImages && opts.SeedImagesMode == "release-pins"
-			_, err := sync(cmd.Context(), &syncOptions)
-			return err
+			return runStacksCommand(cmd.Context(), opts, "sync", func(ctx context.Context) error {
+				syncOptions := *opts
+				syncOptions.RewriteBootstrapImagePins = opts.SeedImages && opts.SeedImagesMode == "release-pins"
+				_, err := sync(ctx, &syncOptions)
+				return err
+			})
 		},
 	}
 	syncCmd.Flags().BoolVar(&opts.SeedImages, "seed-images", true, "rewrite ryzen bootstrap image references from release pins into the local Gitea snapshot")
@@ -158,7 +170,9 @@ func newStacksCmd() *cobra.Command {
 		Use:   "status",
 		Short: "Show local stacks cluster and GitOps status",
 		RunE: func(cmd *cobra.Command, args []string) error {
-			return status(cmd.Context(), opts)
+			return runStacksCommand(cmd.Context(), opts, "status", func(ctx context.Context) error {
+				return status(ctx, opts)
+			})
 		},
 	}
 
@@ -189,9 +203,10 @@ func defaultOptions() *options {
 		SkipTektonBuild:    true,
 		SeedImages:         true,
 		SeedImagesMode:     "release-pins",
-		SeedImageJobs:      4,
+		SeedImageJobs:      6,
 		RefreshKubeconfig:  true,
 		ReadinessProfile:   defaultReadinessProfile,
+		WaitTarget:         waitTargetInnerLoop,
 		TalosSubnet:        "10.6.0.0/24",
 		TalosWorkers:       2,
 		TalosControlMemory: "6GiB",
@@ -249,6 +264,9 @@ func (o *options) validate() error {
 	if o.SeedImageJobs < 1 {
 		return fmt.Errorf("--seed-image-jobs must be at least 1")
 	}
+	if !validWaitTarget(o.WaitTarget) {
+		return fmt.Errorf("unsupported --wait-target %q; expected bootstrap, gitops-core, inner-loop, observability, or all", o.WaitTarget)
+	}
 	return nil
 }
 
@@ -260,11 +278,36 @@ func (o *options) applyProviderDefaults(cmd *cobra.Command) {
 		if !flagChanged(cmd, "readiness-profile") && (o.ReadinessProfile == "" || o.ReadinessProfile == defaultReadinessProfile || o.ReadinessProfile == filepath.Join(o.StacksRepo, defaultReadinessProfile)) {
 			o.ReadinessProfile = filepath.Join(o.StacksRepo, defaultLegacyKindReadinessProfile)
 		}
+		if !flagChanged(cmd, "wait-target") {
+			o.WaitTarget = waitTargetAll
+		}
+		if !flagChanged(cmd, "seed-image-jobs") {
+			o.SeedImageJobs = 4
+		}
 		return
 	}
 	if !flagChanged(cmd, "readiness-profile") && (o.ReadinessProfile == "" || o.ReadinessProfile == defaultReadinessProfile) {
 		o.ReadinessProfile = filepath.Join(o.StacksRepo, defaultReadinessProfile)
 	}
+}
+
+func validWaitTarget(target string) bool {
+	for _, candidate := range waitCohortsThrough(waitTargetAll) {
+		if target == candidate {
+			return true
+		}
+	}
+	return false
+}
+
+func waitCohortsThrough(target string) []string {
+	cohorts := []string{waitTargetBootstrap, waitTargetGitOpsCore, waitTargetInnerLoop, waitTargetObservability, waitTargetAll}
+	for i, cohort := range cohorts {
+		if cohort == target {
+			return cohorts[:i+1]
+		}
+	}
+	return cohorts
 }
 
 func flagChanged(cmd *cobra.Command, name string) bool {
