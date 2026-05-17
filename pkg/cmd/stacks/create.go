@@ -224,7 +224,17 @@ func bootstrapStacksGitOps(ctx context.Context, o *options, postDeleteCleanup *a
 		_ = withReadinessPhase(ctx, o, "argocd-init", func() error {
 			authEnv := append([]string{}, env...)
 			authEnv = append(authEnv, "ARGOCD_AUTH_1PASSWORD=disabled", "ARGOCD_LOCAL_PASSWORD=developer")
-			return run(ctx, o.StacksRepo, authEnv, "bash", "-lc", fmt.Sprintf("source %q && sleep 2 && argocd-auth-init && sync-manual-apps", filepath.Join(o.StacksRepo, "deployment", "scripts", "cluster-menu.sh")))
+			return run(ctx, o.StacksRepo, authEnv, "bash", "-lc", fmt.Sprintf("source %q && sleep 2 && argocd-auth-init", filepath.Join(o.StacksRepo, "deployment", "scripts", "cluster-menu.sh")))
+		})
+		_ = withReadinessPhase(ctx, o, "sync-core-secret-apps", func() error {
+			authEnv := append([]string{}, env...)
+			authEnv = append(authEnv, "ARGOCD_AUTH_1PASSWORD=disabled", "ARGOCD_LOCAL_PASSWORD=developer")
+			return run(ctx, o.StacksRepo, authEnv, "bash", "-lc", fmt.Sprintf("source %q && argocd-auth-init && sync-core-secret-apps", filepath.Join(o.StacksRepo, "deployment", "scripts", "cluster-menu.sh")))
+		})
+		_ = withReadinessPhase(ctx, o, "sync-manual-apps", func() error {
+			authEnv := append([]string{}, env...)
+			authEnv = append(authEnv, "ARGOCD_AUTH_1PASSWORD=disabled", "ARGOCD_LOCAL_PASSWORD=developer")
+			return run(ctx, o.StacksRepo, authEnv, "bash", "-lc", fmt.Sprintf("source %q && argocd-auth-init && sync-manual-apps", filepath.Join(o.StacksRepo, "deployment", "scripts", "cluster-menu.sh")))
 		})
 	}
 	for _, cohort := range waitCohortsThrough(o.WaitTarget) {
