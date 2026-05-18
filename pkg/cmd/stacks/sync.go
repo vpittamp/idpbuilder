@@ -238,6 +238,9 @@ func pushSnapshotToRemote(ctx context.Context, remote string, o *options) (syncR
 	if err := run(ctx, cacheDir, os.Environ(), "git", "add", "-A"); err != nil {
 		return syncResult{}, err
 	}
+	if err := forceAddSnapshotFiles(ctx, cacheDir, files); err != nil {
+		return syncResult{}, err
+	}
 	changed, err := stagedChangedFiles(ctx, cacheDir)
 	if err != nil {
 		return syncResult{}, err
@@ -521,6 +524,32 @@ func copySnapshotPath(srcRoot, dstRoot, rel string) error {
 		return fmt.Errorf("closing %s: %w", dst, err)
 	}
 	return nil
+}
+
+func forceAddSnapshotFiles(ctx context.Context, cacheDir string, files []string) error {
+	if len(files) == 0 {
+		return nil
+	}
+	pathspec, err := os.CreateTemp("", "idpbuilder-stacks-pathspec-*")
+	if err != nil {
+		return fmt.Errorf("creating git pathspec file: %w", err)
+	}
+	pathspecName := pathspec.Name()
+	defer os.Remove(pathspecName)
+	for _, file := range files {
+		if _, err := pathspec.WriteString(file); err != nil {
+			_ = pathspec.Close()
+			return fmt.Errorf("writing git pathspec file: %w", err)
+		}
+		if _, err := pathspec.Write([]byte{0}); err != nil {
+			_ = pathspec.Close()
+			return fmt.Errorf("writing git pathspec file: %w", err)
+		}
+	}
+	if err := pathspec.Close(); err != nil {
+		return fmt.Errorf("closing git pathspec file: %w", err)
+	}
+	return run(ctx, cacheDir, os.Environ(), "git", "add", "-A", "--force", "--pathspec-from-file="+pathspecName, "--pathspec-file-nul")
 }
 
 func snapshotHash(ctx context.Context, repo string) (string, error) {

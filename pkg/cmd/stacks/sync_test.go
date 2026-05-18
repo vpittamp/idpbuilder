@@ -134,6 +134,27 @@ func TestPushSnapshotIncludesUntrackedNonIgnoredFiles(t *testing.T) {
 	}
 }
 
+func TestPushSnapshotIncludesTrackedIgnoredFiles(t *testing.T) {
+	ctx := context.Background()
+	source := newSourceRepo(t)
+	remote := newBareRemote(t)
+	opts := testSyncOptions(t, source)
+	ignoredTracked := filepath.Join("deployment", "config", "gitea-values.yaml")
+	mustWrite(t, filepath.Join(source, ".gitignore"), "ignored.txt\ndeployment/config/*\n")
+	mustWrite(t, filepath.Join(source, ignoredTracked), "tracked but ignored")
+	mustRunTest(t, source, "git", "add", ".gitignore")
+	mustRunTest(t, source, "git", "add", "-f", ignoredTracked)
+	mustRunTest(t, source, "git", "commit", "-m", "track ignored config")
+
+	if _, err := pushSnapshotToRemote(ctx, remote, opts); err != nil {
+		t.Fatal(err)
+	}
+	tree := gitOutputTest(t, remote, "git", "ls-tree", "-r", "--name-only", "refs/heads/main")
+	if !strings.Contains(tree, ignoredTracked) {
+		t.Fatalf("tracked ignored file missing from remote tree:\n%s", tree)
+	}
+}
+
 func TestResetLocalHistoryCreatesRootCommit(t *testing.T) {
 	ctx := context.Background()
 	source := newSourceRepo(t)
