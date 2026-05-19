@@ -52,8 +52,11 @@ func TestHotLoopReadinessVerdict(t *testing.T) {
 	if got := hotLoopReadinessVerdict("abcdef", "abcdef", readyHook, true, nil, nil); got != "Hot loop ready" {
 		t.Fatalf("ready verdict mismatch: %s", got)
 	}
-	if got := hotLoopReadinessVerdict("abcdef", "old", readyHook, true, nil, nil); got != "Hot loop degraded" {
-		t.Fatalf("degraded revision verdict mismatch: %s", got)
+	if got := hotLoopReadinessVerdict("abcdef", "old", readyHook, true, nil, nil); got != "Hot loop ready" {
+		t.Fatalf("child-only snapshot should keep hot loop ready despite root revision lag: %s", got)
+	}
+	if got := hotLoopReadinessVerdict("abcdef", "abcdef", giteaWebhookStatus{Ready: false, Exists: true}, true, nil, nil); got != "Hot loop degraded" {
+		t.Fatalf("degraded webhook verdict mismatch: %s", got)
 	}
 	if got := hotLoopReadinessVerdict("", "abcdef", readyHook, true, nil, nil); got != "Hot loop unavailable" {
 		t.Fatalf("unavailable snapshot verdict mismatch: %s", got)

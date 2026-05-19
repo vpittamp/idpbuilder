@@ -128,7 +128,7 @@ func hotLoopReadinessVerdict(snapshot, rootRevision string, hook giteaWebhookSta
 	if snapshot == "" || rootRevision == "" || !hookAvailable || appsErr != nil {
 		return "Hot loop unavailable"
 	}
-	if !revisionMatches(rootRevision, snapshot) || !hook.Ready || len(problems) > 0 {
+	if !hook.Ready || len(problems) > 0 {
 		return "Hot loop degraded"
 	}
 	return "Hot loop ready"
