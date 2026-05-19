@@ -115,6 +115,144 @@ func TestPushSnapshotRemovesDeletedFilesFromCacheTree(t *testing.T) {
 	}
 }
 
+func TestPushSnapshotRemovesDeletedUntrackedFilesFromCacheTree(t *testing.T) {
+	ctx := context.Background()
+	source := newSourceRepo(t)
+	remote := newBareRemote(t)
+	opts := testSyncOptions(t, source)
+	mustWrite(t, filepath.Join(source, "untracked.txt"), "untracked")
+
+	if _, err := pushSnapshotToRemote(ctx, remote, opts); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(filepath.Join(source, "untracked.txt")); err != nil {
+		t.Fatal(err)
+	}
+	result, err := pushSnapshotToRemote(ctx, remote, opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Noop {
+		t.Fatalf("expected sync commit for deleted untracked file, got %#v", result)
+	}
+	tree := gitOutputTest(t, remote, "git", "ls-tree", "-r", "--name-only", "refs/heads/main")
+	if strings.Contains(tree, "untracked.txt") {
+		t.Fatalf("deleted untracked file remained in remote tree:\n%s", tree)
+	}
+}
+
+func TestReconcileCacheWorktreeCopiesChangedAndRemovesStaleOnly(t *testing.T) {
+	src := t.TempDir()
+	dst := t.TempDir()
+	mustWrite(t, filepath.Join(src, "same.txt"), "same")
+	mustWrite(t, filepath.Join(src, "changed.txt"), "new")
+	mustWrite(t, filepath.Join(src, "nested/keep.txt"), "keep")
+	mustWrite(t, filepath.Join(dst, "same.txt"), "same")
+	mustWrite(t, filepath.Join(dst, "changed.txt"), "old")
+	mustWrite(t, filepath.Join(dst, "nested/keep.txt"), "keep")
+	mustWrite(t, filepath.Join(dst, "nested/stale.txt"), "stale")
+	mustWrite(t, filepath.Join(dst, "stale.txt"), "stale")
+	oldTime := time.Now().Add(-time.Hour)
+	if err := os.Chtimes(filepath.Join(dst, "same.txt"), oldTime, oldTime); err != nil {
+		t.Fatal(err)
+	}
+	srcSame, err := os.Stat(filepath.Join(src, "same.txt"))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	files := []string{"same.txt", "changed.txt", "nested/keep.txt"}
+	touched, err := reconcileCacheWorktree(src, dst, files, files)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantTouched := []string{"changed.txt", "nested/stale.txt", "stale.txt"}
+	if !reflect.DeepEqual(touched, wantTouched) {
+		t.Fatalf("touched paths mismatch\nwant: %#v\n got: %#v", wantTouched, touched)
+	}
+
+	after, err := os.Stat(filepath.Join(dst, "same.txt"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !after.ModTime().Equal(srcSame.ModTime()) {
+		t.Fatalf("unchanged file mtime was not normalized to source: want=%s got=%s", srcSame.ModTime(), after.ModTime())
+	}
+	changed, err := os.ReadFile(filepath.Join(dst, "changed.txt"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(changed) != "new" {
+		t.Fatalf("changed file not copied, got %q", string(changed))
+	}
+	for _, stale := range []string{"stale.txt", "nested/stale.txt"} {
+		if _, err := os.Stat(filepath.Join(dst, stale)); !os.IsNotExist(err) {
+			t.Fatalf("stale file %s still exists or stat failed with %v", stale, err)
+		}
+	}
+}
+
+func TestShouldRewriteBootstrapImagePinsOnlyForImageInputs(t *testing.T) {
+	if shouldRewriteBootstrapImagePins([]string{"packages/components/active-development/manifests/kueue-capacity/Service-capacity-observer.yaml"}) {
+		t.Fatalf("did not expect service hot edit to require bootstrap image rewrite")
+	}
+	for _, touched := range [][]string{
+		{"packages/components/hub-spoke-appsets/release-pins/workflow-builder-images.yaml"},
+		{"packages/components/active-development/manifests/workflow-builder/kustomization.yaml"},
+		{"packages/components/active-development/manifests/workflow-builder/kustomization.yml"},
+		{"packages/components/active-development/manifests/workflow-builder/Kustomization"},
+	} {
+		if !shouldRewriteBootstrapImagePins(touched) {
+			t.Fatalf("expected touched paths to require bootstrap image rewrite: %v", touched)
+		}
+	}
+}
+
+func TestPlanCacheReconcileSkipsUnchangedBootstrapRewriteInputs(t *testing.T) {
+	src := t.TempDir()
+	dst := t.TempDir()
+	mustWrite(t, filepath.Join(src, "packages/components/active-development/manifests/workflow-builder/kustomization.yaml"), "images:\n- name: workflow-builder\n  newName: workflow-builder\n")
+	mustWrite(t, filepath.Join(src, "packages/components/active-development/manifests/workflow-builder/Deployment.yaml"), "kind: Deployment\n")
+	mustWrite(t, filepath.Join(dst, "packages/components/active-development/manifests/workflow-builder/kustomization.yaml"), "images:\n- name: workflow-builder\n  newName: gitea.cnoe.localtest.me/giteaadmin/workflow-builder\n")
+	mustWrite(t, filepath.Join(dst, "packages/components/active-development/manifests/workflow-builder/Deployment.yaml"), "kind: Deployment\n")
+	if err := os.MkdirAll(filepath.Join(dst, ".git"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	files := []string{
+		"packages/components/active-development/manifests/workflow-builder/Deployment.yaml",
+		"packages/components/active-development/manifests/workflow-builder/kustomization.yaml",
+	}
+	if err := saveBootstrapRewriteMetadata(src, dst, files); err != nil {
+		t.Fatal(err)
+	}
+
+	opts := testSyncOptions(t, src)
+	opts.RewriteBootstrapImagePins = true
+	reconcileFiles, forceRewrite, err := planCacheReconcileFiles(src, dst, files, opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []string{"packages/components/active-development/manifests/workflow-builder/Deployment.yaml"}
+	if !reflect.DeepEqual(reconcileFiles, want) {
+		t.Fatalf("reconcile files mismatch\nwant: %#v\n got: %#v", want, reconcileFiles)
+	}
+	if forceRewrite {
+		t.Fatalf("unchanged bootstrap rewrite input should not force rewrite")
+	}
+
+	mustWrite(t, filepath.Join(src, "packages/components/active-development/manifests/workflow-builder/kustomization.yaml"), "images:\n- name: workflow-builder\n  newName: workflow-builder-v2\n")
+	reconcileFiles, forceRewrite, err = planCacheReconcileFiles(src, dst, files, opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(reconcileFiles, files) {
+		t.Fatalf("changed rewrite input should be reconciled\nwant: %#v\n got: %#v", files, reconcileFiles)
+	}
+	if !forceRewrite {
+		t.Fatalf("changed bootstrap rewrite input should force rewrite")
+	}
+}
+
 func TestAffectedPlanRefreshesOnlyChangedChildManifestApp(t *testing.T) {
 	repo := newPlannerRepo(t)
 	apps := argoApplicationList{Items: []argoApplication{

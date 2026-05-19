@@ -516,15 +516,15 @@ func pushSnapshotToRemote(ctx context.Context, remote string, o *options) (syncR
 	if err := prepareSyncCache(ctx, cacheDir, remote, o); err != nil {
 		return syncResult{}, err
 	}
-	if err := clearCacheWorktree(cacheDir); err != nil {
+	reconcileFiles, forceBootstrapRewrite, err := planCacheReconcileFiles(o.StacksRepo, cacheDir, files, o)
+	if err != nil {
 		return syncResult{}, err
 	}
-	for _, file := range files {
-		if err := copySnapshotPath(o.StacksRepo, cacheDir, file); err != nil {
-			return syncResult{}, err
-		}
+	touched, err := reconcileCacheWorktree(o.StacksRepo, cacheDir, reconcileFiles, files)
+	if err != nil {
+		return syncResult{}, err
 	}
-	if o.RewriteBootstrapImagePins {
+	if o.RewriteBootstrapImagePins && (forceBootstrapRewrite || shouldRewriteBootstrapImagePins(touched)) {
 		if err := rewriteBootstrapImagePins(ctx, o, cacheDir); err != nil {
 			return syncResult{}, err
 		}
@@ -540,6 +540,9 @@ func pushSnapshotToRemote(ctx context.Context, remote string, o *options) (syncR
 		return syncResult{}, err
 	}
 	if len(changed) == 0 {
+		if o.RewriteBootstrapImagePins {
+			_ = saveBootstrapRewriteMetadata(o.StacksRepo, cacheDir, files)
+		}
 		return syncResult{Noop: true}, nil
 	}
 	message := fmt.Sprintf("sync stacks snapshot %s", time.Now().Format(time.RFC3339))
@@ -559,6 +562,9 @@ func pushSnapshotToRemote(ctx context.Context, remote string, o *options) (syncR
 			return syncResult{}, fmt.Errorf("Refusing non-fast-forward push; run with --reset-local-history to replace local Gitea history: %w", err)
 		}
 		return syncResult{}, err
+	}
+	if o.RewriteBootstrapImagePins {
+		_ = saveBootstrapRewriteMetadata(o.StacksRepo, cacheDir, files)
 	}
 	return syncResult{Commit: strings.TrimSpace(commit), ChangedFiles: changed}, nil
 }
@@ -684,20 +690,305 @@ func remoteHasAnyHead(ctx context.Context, dir string) (bool, error) {
 	return strings.TrimSpace(out) != "", nil
 }
 
-func clearCacheWorktree(cacheDir string) error {
-	entries, err := os.ReadDir(cacheDir)
-	if err != nil {
-		return fmt.Errorf("reading sync cache %s: %w", cacheDir, err)
+func planCacheReconcileFiles(srcRoot, dstRoot string, files []string, o *options) ([]string, bool, error) {
+	if !o.RewriteBootstrapImagePins {
+		return files, false, nil
 	}
-	for _, entry := range entries {
-		if entry.Name() == ".git" {
+	metadata, err := loadBootstrapRewriteMetadata(dstRoot)
+	if err != nil {
+		metadata = map[string]bootstrapRewriteMetadataEntry{}
+	}
+	reconcileFiles := make([]string, 0, len(files))
+	forceBootstrapRewrite := false
+	for _, file := range files {
+		if !isBootstrapRewriteInputPath(file) {
+			reconcileFiles = append(reconcileFiles, file)
 			continue
 		}
-		if err := os.RemoveAll(filepath.Join(cacheDir, entry.Name())); err != nil {
-			return fmt.Errorf("clearing sync cache path %s: %w", entry.Name(), err)
+		hash, err := hashSnapshotPath(srcRoot, file)
+		if err != nil {
+			return nil, false, err
+		}
+		entry := metadata[file]
+		if entry.SourceHash == hash {
+			cacheHash, err := hashSnapshotPath(dstRoot, file)
+			if err == nil && entry.CacheHash == cacheHash {
+				continue
+			}
+			if err != nil && !errors.Is(err, os.ErrNotExist) {
+				return nil, false, err
+			}
+		}
+		reconcileFiles = append(reconcileFiles, file)
+		forceBootstrapRewrite = true
+	}
+	return reconcileFiles, forceBootstrapRewrite, nil
+}
+
+type bootstrapRewriteMetadataEntry struct {
+	SourceHash string `json:"sourceHash"`
+	CacheHash  string `json:"cacheHash"`
+}
+
+func loadBootstrapRewriteMetadata(cacheDir string) (map[string]bootstrapRewriteMetadataEntry, error) {
+	path := bootstrapRewriteMetadataPath(cacheDir)
+	data, err := os.ReadFile(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return map[string]bootstrapRewriteMetadataEntry{}, nil
+		}
+		return nil, fmt.Errorf("reading bootstrap rewrite metadata: %w", err)
+	}
+	metadata := map[string]bootstrapRewriteMetadataEntry{}
+	if err := json.Unmarshal(data, &metadata); err != nil {
+		return nil, fmt.Errorf("parsing bootstrap rewrite metadata: %w", err)
+	}
+	return metadata, nil
+}
+
+func saveBootstrapRewriteMetadata(srcRoot, cacheDir string, files []string) error {
+	metadata := map[string]bootstrapRewriteMetadataEntry{}
+	for _, file := range files {
+		if !isBootstrapRewriteInputPath(file) {
+			continue
+		}
+		sourceHash, err := hashSnapshotPath(srcRoot, file)
+		if err != nil {
+			return err
+		}
+		cacheHash, err := hashSnapshotPath(cacheDir, file)
+		if err != nil {
+			return err
+		}
+		metadata[file] = bootstrapRewriteMetadataEntry{
+			SourceHash: sourceHash,
+			CacheHash:  cacheHash,
+		}
+	}
+	data, err := json.MarshalIndent(metadata, "", "  ")
+	if err != nil {
+		return err
+	}
+	data = append(data, '\n')
+	path := bootstrapRewriteMetadataPath(cacheDir)
+	if err := os.WriteFile(path, data, 0o644); err != nil {
+		return fmt.Errorf("writing bootstrap rewrite metadata: %w", err)
+	}
+	return nil
+}
+
+func bootstrapRewriteMetadataPath(cacheDir string) string {
+	return filepath.Join(cacheDir, ".git", "idpbuilder-bootstrap-source-hashes.json")
+}
+
+func hashSnapshotPath(srcRoot, rel string) (string, error) {
+	data, err := os.ReadFile(filepath.Join(srcRoot, rel))
+	if err != nil {
+		return "", fmt.Errorf("reading %s: %w", rel, err)
+	}
+	sum := sha256.Sum256(data)
+	return hex.EncodeToString(sum[:]), nil
+}
+
+func reconcileCacheWorktree(srcRoot, dstRoot string, files, wantedFiles []string) ([]string, error) {
+	wanted := make(map[string]bool, len(wantedFiles))
+	for _, file := range wantedFiles {
+		wanted[filepath.ToSlash(file)] = true
+	}
+	touched, err := removeStaleCachePaths(dstRoot, wanted)
+	if err != nil {
+		return nil, err
+	}
+	for _, file := range files {
+		if same, err := snapshotPathMatches(srcRoot, dstRoot, file); err != nil {
+			return nil, err
+		} else if same {
+			continue
+		}
+		if err := copySnapshotPath(srcRoot, dstRoot, file); err != nil {
+			return nil, err
+		}
+		touched = append(touched, filepath.ToSlash(file))
+	}
+	if err := removeEmptyCacheDirs(dstRoot); err != nil {
+		return nil, err
+	}
+	return sortedUniqueStrings(touched), nil
+}
+
+func removeStaleCachePaths(dstRoot string, wanted map[string]bool) ([]string, error) {
+	var removed []string
+	err := filepath.WalkDir(dstRoot, func(path string, entry os.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if path == dstRoot {
+			return nil
+		}
+		rel, err := filepath.Rel(dstRoot, path)
+		if err != nil {
+			return err
+		}
+		rel = filepath.ToSlash(rel)
+		if rel == ".git" || strings.HasPrefix(rel, ".git/") {
+			if entry.IsDir() {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		if entry.IsDir() {
+			if wanted[rel] {
+				if err := os.RemoveAll(path); err != nil {
+					return fmt.Errorf("removing stale cache directory %s: %w", rel, err)
+				}
+				removed = append(removed, rel)
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		if !wanted[rel] {
+			if err := os.Remove(path); err != nil {
+				return fmt.Errorf("removing stale cache file %s: %w", rel, err)
+			}
+			removed = append(removed, rel)
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return removed, nil
+}
+
+func removeEmptyCacheDirs(dstRoot string) error {
+	var dirs []string
+	if err := filepath.WalkDir(dstRoot, func(path string, entry os.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if path == dstRoot {
+			return nil
+		}
+		rel, err := filepath.Rel(dstRoot, path)
+		if err != nil {
+			return err
+		}
+		rel = filepath.ToSlash(rel)
+		if rel == ".git" || strings.HasPrefix(rel, ".git/") {
+			if entry.IsDir() {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		if entry.IsDir() {
+			dirs = append(dirs, path)
+		}
+		return nil
+	}); err != nil {
+		return err
+	}
+	sort.Slice(dirs, func(i, j int) bool { return len(dirs[i]) > len(dirs[j]) })
+	for _, dir := range dirs {
+		entries, err := os.ReadDir(dir)
+		if err != nil {
+			if os.IsNotExist(err) {
+				continue
+			}
+			return err
+		}
+		if len(entries) == 0 {
+			if err := os.Remove(dir); err != nil && !os.IsNotExist(err) {
+				return err
+			}
 		}
 	}
 	return nil
+}
+
+func snapshotPathMatches(srcRoot, dstRoot, rel string) (bool, error) {
+	src := filepath.Join(srcRoot, rel)
+	dst := filepath.Join(dstRoot, rel)
+	srcInfo, err := os.Lstat(src)
+	if err != nil {
+		return false, fmt.Errorf("stat %s: %w", src, err)
+	}
+	dstInfo, err := os.Lstat(dst)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return false, nil
+		}
+		return false, fmt.Errorf("stat %s: %w", dst, err)
+	}
+	if srcInfo.Mode()&os.ModeSymlink != 0 {
+		if dstInfo.Mode()&os.ModeSymlink == 0 {
+			return false, nil
+		}
+		srcTarget, err := os.Readlink(src)
+		if err != nil {
+			return false, fmt.Errorf("reading symlink %s: %w", src, err)
+		}
+		dstTarget, err := os.Readlink(dst)
+		if err != nil {
+			return false, fmt.Errorf("reading symlink %s: %w", dst, err)
+		}
+		return srcTarget == dstTarget, nil
+	}
+	if !srcInfo.Mode().IsRegular() {
+		return false, fmt.Errorf("unsupported snapshot file mode %s for %s", srcInfo.Mode(), rel)
+	}
+	if !dstInfo.Mode().IsRegular() {
+		return false, nil
+	}
+	if srcInfo.Mode().Perm() != dstInfo.Mode().Perm() || srcInfo.Size() != dstInfo.Size() {
+		return false, nil
+	}
+	equal, err := regularFilesEqual(src, dst)
+	if err != nil {
+		return false, err
+	}
+	if !equal {
+		return false, nil
+	}
+	if err := syncSnapshotPathMetadata(srcInfo, dst); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
+func shouldRewriteBootstrapImagePins(touched []string) bool {
+	for _, file := range touched {
+		if isBootstrapRewriteInputPath(file) {
+			return true
+		}
+	}
+	return false
+}
+
+func isBootstrapRewriteInputPath(file string) bool {
+	file = filepath.ToSlash(file)
+	if file == "packages/components/hub-spoke-appsets/release-pins/workflow-builder-images.yaml" {
+		return true
+	}
+	return strings.HasPrefix(file, "packages/components/active-development/manifests/") && isKustomizationFileName(filepath.Base(file))
+}
+
+func isKustomizationFileName(name string) bool {
+	switch name {
+	case "kustomization.yaml", "kustomization.yml", "Kustomization":
+		return true
+	default:
+		return false
+	}
+}
+
+func sortedUniqueStrings(values []string) []string {
+	seen := map[string]bool{}
+	for _, value := range values {
+		if value != "" {
+			seen[value] = true
+		}
+	}
+	return sortedKeys(seen)
 }
 
 func stagedChangedFiles(ctx context.Context, dir string) ([]string, error) {
@@ -817,7 +1108,55 @@ func copySnapshotPath(srcRoot, dstRoot, rel string) error {
 	if err := out.Close(); err != nil {
 		return fmt.Errorf("closing %s: %w", dst, err)
 	}
+	if err := syncSnapshotPathMetadata(st, dst); err != nil {
+		return err
+	}
 	return nil
+}
+
+func syncSnapshotPathMetadata(srcInfo os.FileInfo, dst string) error {
+	if err := os.Chmod(dst, srcInfo.Mode().Perm()); err != nil {
+		return fmt.Errorf("chmod %s: %w", dst, err)
+	}
+	if err := os.Chtimes(dst, srcInfo.ModTime(), srcInfo.ModTime()); err != nil {
+		return fmt.Errorf("preserving mtime for %s: %w", dst, err)
+	}
+	return nil
+}
+
+func regularFilesEqual(first, second string) (bool, error) {
+	left, err := os.Open(first)
+	if err != nil {
+		return false, fmt.Errorf("opening %s: %w", first, err)
+	}
+	defer left.Close()
+	right, err := os.Open(second)
+	if err != nil {
+		return false, fmt.Errorf("opening %s: %w", second, err)
+	}
+	defer right.Close()
+
+	leftBuffer := make([]byte, 32*1024)
+	rightBuffer := make([]byte, 32*1024)
+	for {
+		leftN, leftErr := left.Read(leftBuffer)
+		rightN, rightErr := right.Read(rightBuffer)
+		if leftN != rightN || !bytes.Equal(leftBuffer[:leftN], rightBuffer[:rightN]) {
+			return false, nil
+		}
+		if leftErr == io.EOF && rightErr == io.EOF {
+			return true, nil
+		}
+		if leftErr != nil && leftErr != io.EOF {
+			return false, fmt.Errorf("reading %s: %w", first, leftErr)
+		}
+		if rightErr != nil && rightErr != io.EOF {
+			return false, fmt.Errorf("reading %s: %w", second, rightErr)
+		}
+		if leftErr == io.EOF || rightErr == io.EOF {
+			return false, nil
+		}
+	}
 }
 
 func forceAddSnapshotFiles(ctx context.Context, cacheDir string, files []string) error {
