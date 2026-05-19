@@ -6,6 +6,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -51,7 +52,9 @@ func sync(ctx context.Context, o *options) (syncResult, error) {
 		fmt.Println("No changes to sync")
 		return result, nil
 	}
-	refreshStackApplications(ctx, o)
+	if err := refreshStackApplications(ctx, o); err != nil {
+		return result, fmt.Errorf("synced snapshot %s but failed to refresh ArgoCD applications: %w", result.Commit, err)
+	}
 	fmt.Printf("Synced %d changed files from %s to %s/%s:%s at %s\n", result.Files, o.StacksRepo, o.GiteaOwner, o.GiteaRepo, o.Branch, result.Commit)
 	return result, nil
 }
@@ -589,21 +592,19 @@ type argoApplicationSource struct {
 	RepoURL string `json:"repoURL"`
 }
 
-func refreshStackApplications(ctx context.Context, o *options) {
+func refreshStackApplications(ctx context.Context, o *options) error {
 	names, err := stackApplicationNames(ctx, o)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "warning: failed to list ArgoCD applications for refresh: %v\n", err)
-		names = []string{"root-application"}
-	}
-	if len(names) == 0 {
-		names = []string{"root-application"}
+		return err
 	}
 
+	var errs []error
 	for _, name := range names {
 		if err := run(ctx, o.StacksRepo, withStacksEnv(o), "kubectl", "annotate", "application", name, "-n", "argocd", "argocd.argoproj.io/refresh=hard", "--overwrite"); err != nil {
-			fmt.Fprintf(os.Stderr, "warning: failed to refresh ArgoCD application %s: %v\n", name, err)
+			errs = append(errs, fmt.Errorf("refreshing ArgoCD application %s: %w", name, err))
 		}
 	}
+	return errors.Join(errs...)
 }
 
 func stackApplicationNames(ctx context.Context, o *options) ([]string, error) {
@@ -617,6 +618,14 @@ func stackApplicationNames(ctx context.Context, o *options) ([]string, error) {
 	}
 
 	suffix := fmt.Sprintf("/%s/%s.git", o.GiteaOwner, o.GiteaRepo)
+	names := matchingStackApplicationNames(apps, suffix)
+	if len(names) == 0 {
+		return nil, fmt.Errorf("no ArgoCD applications source repo %s", suffix)
+	}
+	return names, nil
+}
+
+func matchingStackApplicationNames(apps argoApplicationList, suffix string) []string {
 	names := make([]string, 0, len(apps.Items))
 	seen := map[string]bool{}
 	for _, app := range apps.Items {
@@ -631,7 +640,7 @@ func stackApplicationNames(ctx context.Context, o *options) ([]string, error) {
 		names = append(names, name)
 	}
 	sort.Strings(names)
-	return names, nil
+	return names
 }
 
 func applicationUsesRepo(app argoApplication, repoSuffix string) bool {

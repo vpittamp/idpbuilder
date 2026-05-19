@@ -242,6 +242,39 @@ func TestApplicationUsesRepoMatchesMultiSourceApps(t *testing.T) {
 	}
 }
 
+func TestMatchingStackApplicationNamesSortsAndDeduplicates(t *testing.T) {
+	suffix := "/giteaadmin/stacks.git"
+	first := argoApplication{}
+	first.Metadata.Name = "workflow-builder"
+	first.Spec.Source.RepoURL = "http://gitea-http.gitea.svc.cluster.local:3000/giteaadmin/stacks.git"
+	duplicate := argoApplication{}
+	duplicate.Metadata.Name = "workflow-builder"
+	duplicate.Spec.Sources = []argoApplicationSource{{RepoURL: "https://gitea.cnoe.localtest.me/giteaadmin/stacks.git"}}
+	second := argoApplication{}
+	second.Metadata.Name = "root-application"
+	second.Spec.Source.RepoURL = "giteaadmin/stacks.git"
+	other := argoApplication{}
+	other.Metadata.Name = "other"
+	other.Spec.Source.RepoURL = "https://github.com/PittampalliOrg/stacks.git"
+
+	names := matchingStackApplicationNames(argoApplicationList{Items: []argoApplication{first, duplicate, second, other}}, suffix)
+	want := []string{"root-application", "workflow-builder"}
+	if !reflect.DeepEqual(names, want) {
+		t.Fatalf("expected %v, got %v", want, names)
+	}
+}
+
+func TestMatchingStackApplicationNamesReturnsEmptyWhenNoAppsMatch(t *testing.T) {
+	app := argoApplication{}
+	app.Metadata.Name = "workflow-builder"
+	app.Spec.Source.RepoURL = "https://github.com/PittampalliOrg/stacks.git"
+
+	names := matchingStackApplicationNames(argoApplicationList{Items: []argoApplication{app}}, "/giteaadmin/stacks.git")
+	if len(names) != 0 {
+		t.Fatalf("expected no matching applications, got %v", names)
+	}
+}
+
 func newSourceRepo(t *testing.T) string {
 	t.Helper()
 	repo := t.TempDir()
