@@ -900,7 +900,6 @@ func applyPlanToResult(result *syncResult, plan refreshPlan) {
 	result.AffectedApplications = appendUniqueStrings(result.AffectedApplications, plan.AffectedApplications...)
 	result.SkippedFiles = appendUniqueStrings(result.SkippedFiles, plan.SkippedFiles...)
 	result.ManualApplications = appendUniqueStrings(result.ManualApplications, plan.ManualApplications...)
-	result.UnsyncedApplications = appendUniqueStrings(result.UnsyncedApplications, plan.UnsyncedApplications...)
 }
 
 func appendUniqueStrings(base []string, values ...string) []string {

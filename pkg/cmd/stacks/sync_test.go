@@ -208,6 +208,18 @@ func TestAffectedPlanIndexesRawManifestDirectories(t *testing.T) {
 	}
 }
 
+func TestApplyPlanToResultDoesNotKeepPreRefreshUnsyncedApps(t *testing.T) {
+	result := syncResult{}
+	applyPlanToResult(&result, refreshPlan{
+		AffectedApplications: []string{"observability-namespace"},
+		UnsyncedApplications: []string{"observability-namespace"},
+	})
+
+	if len(result.UnsyncedApplications) != 0 {
+		t.Fatalf("pre-refresh unsynced apps should not be reported as final status: %v", result.UnsyncedApplications)
+	}
+}
+
 func TestAffectedPlanFailsClosedForMissingLocalDependency(t *testing.T) {
 	repo := t.TempDir()
 	mustWrite(t, filepath.Join(repo, "packages/components/bad/kustomization.yaml"), "resources:\n  - missing.yaml\n")
