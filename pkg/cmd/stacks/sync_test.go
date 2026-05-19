@@ -208,6 +208,40 @@ func TestMissingRemoteBranchRequiresResetLocalHistory(t *testing.T) {
 	}
 }
 
+func TestApplicationUsesRepoMatchesInternalAndExternalStackURLs(t *testing.T) {
+	suffix := "/giteaadmin/stacks.git"
+	app := argoApplication{}
+	app.Metadata.Name = "workflow-builder"
+	app.Spec.Source.RepoURL = "http://gitea-http.gitea.svc.cluster.local:3000/giteaadmin/stacks.git"
+	if !applicationUsesRepo(app, suffix) {
+		t.Fatalf("expected internal Gitea repo URL to match")
+	}
+
+	app.Spec.Source.RepoURL = "https://gitea.cnoe.localtest.me/giteaadmin/stacks.git/"
+	if !applicationUsesRepo(app, suffix) {
+		t.Fatalf("expected external Gitea repo URL to match")
+	}
+
+	app.Spec.Source.RepoURL = "https://github.com/PittampalliOrg/stacks.git"
+	if applicationUsesRepo(app, suffix) {
+		t.Fatalf("did not expect unrelated owner URL to match")
+	}
+}
+
+func TestApplicationUsesRepoMatchesMultiSourceApps(t *testing.T) {
+	suffix := "/giteaadmin/stacks.git"
+	app := argoApplication{}
+	app.Metadata.Name = "multi-source"
+	app.Spec.Source.RepoURL = "https://example.invalid/other/repo.git"
+	app.Spec.Sources = []argoApplicationSource{
+		{RepoURL: "oci://ghcr.io/pittampalliorg/chart"},
+		{RepoURL: "http://gitea-http.gitea.svc.cluster.local:3000/giteaadmin/stacks.git"},
+	}
+	if !applicationUsesRepo(app, suffix) {
+		t.Fatalf("expected multi-source app to match stacks repo")
+	}
+}
+
 func newSourceRepo(t *testing.T) string {
 	t.Helper()
 	repo := t.TempDir()

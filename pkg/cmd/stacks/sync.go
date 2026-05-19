@@ -51,7 +51,7 @@ func sync(ctx context.Context, o *options) (syncResult, error) {
 		fmt.Println("No changes to sync")
 		return result, nil
 	}
-	refreshRootApplication(ctx, o)
+	refreshStackApplications(ctx, o)
 	fmt.Printf("Synced %d changed files from %s to %s/%s:%s at %s\n", result.Files, o.StacksRepo, o.GiteaOwner, o.GiteaRepo, o.Branch, result.Commit)
 	return result, nil
 }
@@ -571,6 +571,82 @@ func snapshotHash(ctx context.Context, repo string) (string, error) {
 	return hex.EncodeToString(h.Sum(nil)), nil
 }
 
-func refreshRootApplication(ctx context.Context, o *options) {
-	_ = run(ctx, o.StacksRepo, withStacksEnv(o), "kubectl", "annotate", "application", "root-application", "-n", "argocd", "argocd.argoproj.io/refresh=normal", "--overwrite")
+type argoApplicationList struct {
+	Items []argoApplication `json:"items"`
+}
+
+type argoApplication struct {
+	Metadata struct {
+		Name string `json:"name"`
+	} `json:"metadata"`
+	Spec struct {
+		Source  argoApplicationSource   `json:"source"`
+		Sources []argoApplicationSource `json:"sources"`
+	} `json:"spec"`
+}
+
+type argoApplicationSource struct {
+	RepoURL string `json:"repoURL"`
+}
+
+func refreshStackApplications(ctx context.Context, o *options) {
+	names, err := stackApplicationNames(ctx, o)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "warning: failed to list ArgoCD applications for refresh: %v\n", err)
+		names = []string{"root-application"}
+	}
+	if len(names) == 0 {
+		names = []string{"root-application"}
+	}
+
+	for _, name := range names {
+		if err := run(ctx, o.StacksRepo, withStacksEnv(o), "kubectl", "annotate", "application", name, "-n", "argocd", "argocd.argoproj.io/refresh=hard", "--overwrite"); err != nil {
+			fmt.Fprintf(os.Stderr, "warning: failed to refresh ArgoCD application %s: %v\n", name, err)
+		}
+	}
+}
+
+func stackApplicationNames(ctx context.Context, o *options) ([]string, error) {
+	raw, err := output(ctx, o.StacksRepo, withStacksEnv(o), "kubectl", "get", "application", "-n", "argocd", "-o", "json")
+	if err != nil {
+		return nil, err
+	}
+	var apps argoApplicationList
+	if err := json.Unmarshal([]byte(raw), &apps); err != nil {
+		return nil, fmt.Errorf("parsing ArgoCD applications: %w", err)
+	}
+
+	suffix := fmt.Sprintf("/%s/%s.git", o.GiteaOwner, o.GiteaRepo)
+	names := make([]string, 0, len(apps.Items))
+	seen := map[string]bool{}
+	for _, app := range apps.Items {
+		if app.Metadata.Name == "" {
+			continue
+		}
+		if applicationUsesRepo(app, suffix) {
+			seen[app.Metadata.Name] = true
+		}
+	}
+	for name := range seen {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	return names, nil
+}
+
+func applicationUsesRepo(app argoApplication, repoSuffix string) bool {
+	if repoURLMatches(app.Spec.Source.RepoURL, repoSuffix) {
+		return true
+	}
+	for _, source := range app.Spec.Sources {
+		if repoURLMatches(source.RepoURL, repoSuffix) {
+			return true
+		}
+	}
+	return false
+}
+
+func repoURLMatches(repoURL, repoSuffix string) bool {
+	normalized := strings.TrimSuffix(strings.TrimSpace(repoURL), "/")
+	return normalized == strings.TrimPrefix(repoSuffix, "/") || strings.HasSuffix(normalized, repoSuffix)
 }
