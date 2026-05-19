@@ -466,7 +466,7 @@ func watchAndSyncWithFuncs(ctx context.Context, o *options, hashFunc watchHashFu
 	for {
 		select {
 		case <-ctx.Done():
-			return context.Cause(ctx)
+			return nil
 		case <-ticker.C:
 			hash, err := hashFunc(ctx, o.StacksRepo)
 			if err != nil {

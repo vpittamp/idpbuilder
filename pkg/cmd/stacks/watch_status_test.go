@@ -39,8 +39,8 @@ func TestWatchAndSyncRetriesAfterSyncFailure(t *testing.T) {
 	}
 
 	err := watchAndSyncWithFuncs(ctx, opts, hashFunc, syncFunc)
-	if !errors.Is(err, context.Canceled) {
-		t.Fatalf("expected context cancellation after successful retry, got %v", err)
+	if err != nil {
+		t.Fatalf("expected clean shutdown after successful retry, got %v", err)
 	}
 	if syncCalls != 2 {
 		t.Fatalf("expected failed sync to be retried, got %d sync calls", syncCalls)
