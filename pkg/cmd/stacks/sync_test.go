@@ -7,6 +7,7 @@ import (
 	"reflect"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestSnapshotFilesIncludesTrackedAndUntrackedExcludesIgnoredAndDeleted(t *testing.T) {
@@ -155,6 +156,39 @@ func TestAffectedPlanRefreshesRootBeforeChildForApplicationDefinitionChange(t *t
 	}
 }
 
+func TestAffectedPlanTreatsDeletedRyzenOverlayPathAsRootChange(t *testing.T) {
+	repo := t.TempDir()
+	mustWrite(t, filepath.Join(repo, "packages/overlays/ryzen/kustomization.yaml"), `resources:
+  - apps/local-path-provisioner.yaml
+`)
+	mustWrite(t, filepath.Join(repo, "packages/overlays/ryzen/apps/local-path-provisioner.yaml"), `apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: local-path-provisioner
+`)
+	apps := argoApplicationList{Items: []argoApplication{
+		plannerApp(rootApplicationName, "packages/overlays/ryzen", true),
+	}}
+
+	plan, err := planAffectedApplications(repo, apps, []string{
+		"packages/overlays/ryzen/apps/deleted-child.yaml",
+		"packages/overlays/ryzen/manifests/deleted-child/kustomization.yaml",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []string{"root-application"}
+	if !reflect.DeepEqual(plan.AffectedApplications, want) {
+		t.Fatalf("affected apps mismatch\nwant: %#v\n got: %#v", want, plan.AffectedApplications)
+	}
+	if !plan.RootFirst {
+		t.Fatalf("expected root-first plan")
+	}
+	if len(plan.SkippedFiles) != 0 {
+		t.Fatalf("expected deleted overlay paths to be root changes, got skipped %v", plan.SkippedFiles)
+	}
+}
+
 func TestAffectedPlanRefreshesSharedComponentDependentsOnly(t *testing.T) {
 	repo := newPlannerRepo(t)
 	apps := argoApplicationList{Items: []argoApplication{
@@ -217,6 +251,33 @@ func TestApplyPlanToResultDoesNotKeepPreRefreshUnsyncedApps(t *testing.T) {
 
 	if len(result.UnsyncedApplications) != 0 {
 		t.Fatalf("pre-refresh unsynced apps should not be reported as final status: %v", result.UnsyncedApplications)
+	}
+}
+
+func TestReplacePlanInResultDropsPreRootSkippedFiles(t *testing.T) {
+	result := syncResult{
+		AffectedApplications:  []string{"root-application"},
+		SkippedFiles:          []string{"packages/overlays/ryzen/manifests/new-app/kustomization.yaml"},
+		ManualApplications:    []string{"old-manual"},
+		RefreshedApplications: []string{"root-application"},
+	}
+
+	replacePlanInResult(&result, refreshPlan{
+		AffectedApplications: []string{"new-app", "root-application"},
+	})
+
+	wantAffected := []string{"new-app", "root-application"}
+	if !reflect.DeepEqual(result.AffectedApplications, wantAffected) {
+		t.Fatalf("affected apps mismatch\nwant: %#v\n got: %#v", wantAffected, result.AffectedApplications)
+	}
+	if len(result.SkippedFiles) != 0 {
+		t.Fatalf("expected skipped files to be replaced, got %v", result.SkippedFiles)
+	}
+	if len(result.ManualApplications) != 0 {
+		t.Fatalf("expected manual apps to be replaced, got %v", result.ManualApplications)
+	}
+	if !reflect.DeepEqual(result.RefreshedApplications, []string{"root-application"}) {
+		t.Fatalf("refreshed apps should not be replaced: %v", result.RefreshedApplications)
 	}
 }
 
@@ -391,6 +452,92 @@ func TestMatchingStackApplicationNamesReturnsEmptyWhenNoAppsMatch(t *testing.T) 
 	names := matchingStackApplicationNames(argoApplicationList{Items: []argoApplication{app}}, "/giteaadmin/stacks.git")
 	if len(names) != 0 {
 		t.Fatalf("expected no matching applications, got %v", names)
+	}
+}
+
+func TestRefreshAllRefreshesRootThenCurrentLiveChildren(t *testing.T) {
+	ctx := context.Background()
+	repo := t.TempDir()
+	binDir := t.TempDir()
+	statePath := filepath.Join(t.TempDir(), "state")
+	logPath := filepath.Join(t.TempDir(), "kubectl.log")
+	commit := "1234567890abcdef"
+	kubectl := filepath.Join(binDir, "kubectl")
+	mustWrite(t, kubectl, `#!/usr/bin/env bash
+set -euo pipefail
+state="${TEST_KUBECTL_STATE}"
+log="${TEST_KUBECTL_LOG}"
+commit="${TEST_COMMIT}"
+app_json() {
+  local name="$1"
+  local revision="$2"
+  cat <<JSON
+{"metadata":{"name":"${name}"},"spec":{"source":{"repoURL":"http://gitea-http.gitea.svc.cluster.local:3000/giteaadmin/stacks.git","path":"packages/${name}"},"syncPolicy":{"automated":{}}},"status":{"sync":{"status":"Synced","revision":"${revision}"}}}
+JSON
+}
+if [[ "$*" == "get application -n argocd -o json" ]]; then
+  current="$(cat "$state" 2>/dev/null || true)"
+  if [[ "$current" == "workflow" ]]; then
+    printf '{"items":['
+    app_json root-application "$commit"
+    printf ','
+    app_json workflow-builder "$commit"
+    printf ']}'
+  elif [[ "$current" == "root" ]]; then
+    printf '{"items":['
+    app_json root-application "$commit"
+    printf ','
+    app_json workflow-builder old
+    printf ']}'
+  else
+    printf '{"items":['
+    app_json root-application old
+    printf ','
+    app_json workflow-builder old
+    printf ','
+    app_json deleted-test old
+    printf ']}'
+  fi
+  exit 0
+fi
+if [[ "$1" == "annotate" && "$2" == "application" ]]; then
+  echo "$3" >> "$log"
+  if [[ "$3" == "deleted-test" ]]; then
+    exit 42
+  fi
+  if [[ "$3" == "root-application" ]]; then
+    echo root > "$state"
+  elif [[ "$3" == "workflow-builder" ]]; then
+    echo workflow > "$state"
+  fi
+  exit 0
+fi
+exit 64
+`)
+	if err := os.Chmod(kubectl, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	t.Setenv("TEST_KUBECTL_STATE", statePath)
+	t.Setenv("TEST_KUBECTL_LOG", logPath)
+	t.Setenv("TEST_COMMIT", commit)
+
+	opts := testSyncOptions(t, repo)
+	opts.RefreshMode = refreshModeAll
+	opts.SyncWaitTimeout = time.Second
+	result := syncResult{Commit: commit}
+	if err := refreshAfterSync(ctx, opts, &result); err != nil {
+		t.Fatal(err)
+	}
+
+	log := strings.Fields(gitOutputTest(t, filepath.Dir(logPath), "cat", logPath))
+	wantLog := []string{"root-application", "workflow-builder"}
+	if !reflect.DeepEqual(log, wantLog) {
+		t.Fatalf("refresh order mismatch\nwant: %#v\n got: %#v", wantLog, log)
+	}
+	wantRefreshed := []string{"root-application", "workflow-builder"}
+	if !reflect.DeepEqual(result.RefreshedApplications, wantRefreshed) {
+		t.Fatalf("refreshed applications mismatch\nwant: %#v\n got: %#v", wantRefreshed, result.RefreshedApplications)
 	}
 }
 

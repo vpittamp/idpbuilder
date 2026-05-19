@@ -116,6 +116,12 @@ func planAffectedApplications(repo string, apps argoApplicationList, changed []s
 	skipped := make([]string, 0)
 	for _, file := range normalizeChangedFiles(changed) {
 		matched := false
+		if ryzenOverlayPathAffectsRoot(file) {
+			if _, ok := index.apps[rootApplicationName]; ok {
+				affected[rootApplicationName] = true
+				matched = true
+			}
+		}
 		changedChildName, hasChangedChildName := parseApplicationName(filepath.Join(repo, file))
 		if hasChangedChildName {
 			if _, ok := index.apps[changedChildName]; ok {
@@ -405,6 +411,10 @@ func workingTreeChangedFiles(ctx context.Context, repo string) ([]string, error)
 	return sortedKeys(seen), nil
 }
 
+func ryzenOverlayPathAffectsRoot(file string) bool {
+	return file == "packages/overlays/ryzen" || strings.HasPrefix(file, "packages/overlays/ryzen/")
+}
+
 func sortedKeys(m map[string]bool) []string {
 	keys := make([]string, 0, len(m))
 	for key := range m {
@@ -480,16 +490,22 @@ func waitForApplicationsObserved(ctx context.Context, o *options, names []string
 
 func getApplicationsByName(ctx context.Context, o *options, names []string) (map[string]argoApplication, error) {
 	result := map[string]argoApplication{}
+	want := map[string]bool{}
 	for _, name := range names {
-		raw, err := output(ctx, o.StacksRepo, withStacksEnv(o), "kubectl", "get", "application", name, "-n", "argocd", "-o", "json")
-		if err != nil {
-			return nil, fmt.Errorf("getting ArgoCD application %s: %w", name, err)
+		want[name] = true
+	}
+	raw, err := output(ctx, o.StacksRepo, withStacksEnv(o), "kubectl", "get", "application", "-n", "argocd", "-o", "json")
+	if err != nil {
+		return nil, err
+	}
+	var apps argoApplicationList
+	if err := json.Unmarshal([]byte(raw), &apps); err != nil {
+		return nil, fmt.Errorf("parsing ArgoCD applications: %w", err)
+	}
+	for _, app := range apps.Items {
+		if want[app.Metadata.Name] {
+			result[app.Metadata.Name] = app
 		}
-		var app argoApplication
-		if err := json.Unmarshal([]byte(raw), &app); err != nil {
-			return nil, fmt.Errorf("parsing ArgoCD application %s: %w", name, err)
-		}
-		result[name] = app
 	}
 	return result, nil
 }

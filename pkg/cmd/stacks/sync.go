@@ -89,16 +89,46 @@ func refreshAfterSync(ctx context.Context, o *options, result *syncResult) error
 	case refreshModeNone:
 		return nil
 	case refreshModeAll:
-		names, err := stackApplicationNames(ctx, o)
+		apps, err := listStackApplications(ctx, o)
 		if err != nil {
 			return err
 		}
-		result.AffectedApplications = names
-		if err := refreshApplications(ctx, o, names); err != nil {
+		names := stackApplicationNamesFromList(apps)
+		result.AffectedApplications = appendUniqueStrings(result.AffectedApplications, names...)
+		if !containsString(names, rootApplicationName) {
+			if err := refreshApplications(ctx, o, names); err != nil {
+				return err
+			}
+			result.RefreshedApplications = appendUniqueStrings(result.RefreshedApplications, names...)
+			unsynced, err := waitForApplicationsObserved(ctx, o, names, result.Commit)
+			result.UnsyncedApplications = appendUniqueStrings(result.UnsyncedApplications, unsynced...)
 			return err
 		}
-		result.RefreshedApplications = names
-		unsynced, err := waitForApplicationsObserved(ctx, o, names, result.Commit)
+
+		if err := refreshApplications(ctx, o, []string{rootApplicationName}); err != nil {
+			return err
+		}
+		result.RefreshedApplications = appendUniqueStrings(result.RefreshedApplications, rootApplicationName)
+		unsynced, err := waitForApplicationsObserved(ctx, o, []string{rootApplicationName}, result.Commit)
+		result.UnsyncedApplications = appendUniqueStrings(result.UnsyncedApplications, unsynced...)
+		if err != nil {
+			return err
+		}
+		apps, err = listStackApplications(ctx, o)
+		if err != nil {
+			return err
+		}
+		names = stackApplicationNamesFromList(apps)
+		result.AffectedApplications = appendUniqueStrings(result.AffectedApplications, names...)
+		children := withoutString(names, rootApplicationName)
+		if len(children) == 0 {
+			return nil
+		}
+		if err := refreshApplications(ctx, o, children); err != nil {
+			return err
+		}
+		result.RefreshedApplications = appendUniqueStrings(result.RefreshedApplications, children...)
+		unsynced, err = waitForApplicationsObserved(ctx, o, children, result.Commit)
 		result.UnsyncedApplications = appendUniqueStrings(result.UnsyncedApplications, unsynced...)
 		return err
 	case refreshModeAffected:
@@ -132,7 +162,7 @@ func refreshAfterSync(ctx context.Context, o *options, result *syncResult) error
 			if err != nil {
 				return err
 			}
-			applyPlanToResult(result, plan)
+			replacePlanInResult(result, plan)
 		}
 		children := withoutString(plan.AffectedApplications, rootApplicationName)
 		if len(children) == 0 {
@@ -812,12 +842,21 @@ func stackApplicationNames(ctx context.Context, o *options) ([]string, error) {
 	if err != nil {
 		return nil, err
 	}
-	suffix := fmt.Sprintf("/%s/%s.git", o.GiteaOwner, o.GiteaRepo)
-	names := matchingStackApplicationNames(apps, suffix)
+	names := stackApplicationNamesFromList(apps)
 	if len(names) == 0 {
-		return nil, fmt.Errorf("no ArgoCD applications source repo %s", suffix)
+		return nil, fmt.Errorf("no ArgoCD applications source repo /%s/%s.git", o.GiteaOwner, o.GiteaRepo)
 	}
 	return names, nil
+}
+
+func stackApplicationNamesFromList(apps argoApplicationList) []string {
+	seen := map[string]bool{}
+	for _, app := range apps.Items {
+		if app.Metadata.Name != "" {
+			seen[app.Metadata.Name] = true
+		}
+	}
+	return sortedKeys(seen)
 }
 
 func listStackApplications(ctx context.Context, o *options) (argoApplicationList, error) {
@@ -902,6 +941,12 @@ func applyPlanToResult(result *syncResult, plan refreshPlan) {
 	result.ManualApplications = appendUniqueStrings(result.ManualApplications, plan.ManualApplications...)
 }
 
+func replacePlanInResult(result *syncResult, plan refreshPlan) {
+	result.AffectedApplications = append([]string(nil), plan.AffectedApplications...)
+	result.SkippedFiles = append([]string(nil), plan.SkippedFiles...)
+	result.ManualApplications = append([]string(nil), plan.ManualApplications...)
+}
+
 func appendUniqueStrings(base []string, values ...string) []string {
 	seen := map[string]bool{}
 	out := make([]string, 0, len(base)+len(values))
@@ -931,4 +976,13 @@ func withoutString(values []string, drop string) []string {
 		}
 	}
 	return out
+}
+
+func containsString(values []string, want string) bool {
+	for _, value := range values {
+		if value == want {
+			return true
+		}
+	}
+	return false
 }
