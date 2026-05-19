@@ -105,12 +105,119 @@ func TestPushSnapshotRemovesDeletedFilesFromCacheTree(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if result.Files != 1 {
+	if len(result.ChangedFiles) != 1 {
 		t.Fatalf("expected one changed file, got %#v", result)
 	}
 	tree := gitOutputTest(t, remote, "git", "ls-tree", "-r", "--name-only", "refs/heads/main")
 	if strings.Contains(tree, "tracked.txt") {
 		t.Fatalf("deleted file remained in remote tree:\n%s", tree)
+	}
+}
+
+func TestAffectedPlanRefreshesOnlyChangedChildManifestApp(t *testing.T) {
+	repo := newPlannerRepo(t)
+	apps := argoApplicationList{Items: []argoApplication{
+		plannerApp("workflow-builder", "packages/components/active-development/manifests/workflow-builder", true),
+		plannerApp("kueue-capacity", "packages/components/active-development/manifests/kueue-capacity", true),
+	}}
+
+	plan, err := planAffectedApplications(repo, apps, []string{"packages/components/active-development/manifests/workflow-builder/Deployment-workflow-builder.yaml"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []string{"workflow-builder"}
+	if !reflect.DeepEqual(plan.AffectedApplications, want) {
+		t.Fatalf("affected apps mismatch\nwant: %#v\n got: %#v", want, plan.AffectedApplications)
+	}
+	if len(plan.SkippedFiles) != 0 {
+		t.Fatalf("did not expect skipped files, got %v", plan.SkippedFiles)
+	}
+}
+
+func TestAffectedPlanRefreshesRootBeforeChildForApplicationDefinitionChange(t *testing.T) {
+	repo := newPlannerRepo(t)
+	apps := argoApplicationList{Items: []argoApplication{
+		plannerApp(rootApplicationName, "packages/overlays/ryzen", true),
+		plannerApp("workflow-builder", "packages/components/active-development/manifests/workflow-builder", true),
+		plannerApp("kueue-capacity", "packages/components/active-development/manifests/kueue-capacity", true),
+	}}
+
+	plan, err := planAffectedApplications(repo, apps, []string{"packages/components/active-development/apps/workflow-builder.yaml"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []string{"root-application", "workflow-builder"}
+	if !reflect.DeepEqual(plan.AffectedApplications, want) {
+		t.Fatalf("affected apps mismatch\nwant: %#v\n got: %#v", want, plan.AffectedApplications)
+	}
+	if !plan.RootFirst {
+		t.Fatalf("expected root-first plan")
+	}
+}
+
+func TestAffectedPlanRefreshesSharedComponentDependentsOnly(t *testing.T) {
+	repo := newPlannerRepo(t)
+	apps := argoApplicationList{Items: []argoApplication{
+		plannerApp("workflow-builder", "packages/components/active-development/manifests/workflow-builder", true),
+		plannerApp("kueue-capacity", "packages/components/active-development/manifests/kueue-capacity", true),
+	}}
+
+	plan, err := planAffectedApplications(repo, apps, []string{"packages/components/shared/ConfigMap-shared.yaml"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []string{"workflow-builder"}
+	if !reflect.DeepEqual(plan.AffectedApplications, want) {
+		t.Fatalf("affected apps mismatch\nwant: %#v\n got: %#v", want, plan.AffectedApplications)
+	}
+}
+
+func TestAffectedPlanSkipsNonRenderedFiles(t *testing.T) {
+	repo := newPlannerRepo(t)
+	apps := argoApplicationList{Items: []argoApplication{
+		plannerApp("workflow-builder", "packages/components/active-development/manifests/workflow-builder", true),
+	}}
+
+	plan, err := planAffectedApplications(repo, apps, []string{"docs/local-note.md"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(plan.AffectedApplications) != 0 {
+		t.Fatalf("expected no affected apps, got %v", plan.AffectedApplications)
+	}
+	wantSkipped := []string{"docs/local-note.md"}
+	if !reflect.DeepEqual(plan.SkippedFiles, wantSkipped) {
+		t.Fatalf("skipped files mismatch\nwant: %#v\n got: %#v", wantSkipped, plan.SkippedFiles)
+	}
+}
+
+func TestAffectedPlanIndexesRawManifestDirectories(t *testing.T) {
+	repo := t.TempDir()
+	mustWrite(t, filepath.Join(repo, "packages/base/manifests/raw/ConfigMap-raw.yaml"), "kind: ConfigMap\nmetadata:\n  name: raw\n")
+	apps := argoApplicationList{Items: []argoApplication{
+		plannerApp("raw", "packages/base/manifests/raw", true),
+	}}
+
+	plan, err := planAffectedApplications(repo, apps, []string{"packages/base/manifests/raw/ConfigMap-raw.yaml"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []string{"raw"}
+	if !reflect.DeepEqual(plan.AffectedApplications, want) {
+		t.Fatalf("affected apps mismatch\nwant: %#v\n got: %#v", want, plan.AffectedApplications)
+	}
+}
+
+func TestAffectedPlanFailsClosedForMissingLocalDependency(t *testing.T) {
+	repo := t.TempDir()
+	mustWrite(t, filepath.Join(repo, "packages/components/bad/kustomization.yaml"), "resources:\n  - missing.yaml\n")
+	apps := argoApplicationList{Items: []argoApplication{
+		plannerApp("bad", "packages/components/bad", true),
+	}}
+
+	_, err := planAffectedApplications(repo, apps, []string{"packages/components/bad/kustomization.yaml"})
+	if err == nil || !strings.Contains(err.Error(), "missing.yaml") {
+		t.Fatalf("expected missing dependency error, got %v", err)
 	}
 }
 
@@ -307,6 +414,63 @@ func testSyncOptions(t *testing.T, source string) *options {
 		Branch:        "main",
 		CacheDir:      filepath.Join(t.TempDir(), "cache"),
 	}
+}
+
+func newPlannerRepo(t *testing.T) string {
+	t.Helper()
+	repo := t.TempDir()
+	mustWrite(t, filepath.Join(repo, "packages/overlays/ryzen/kustomization.yaml"), `resources:
+  - ../../components/active-development
+`)
+	mustWrite(t, filepath.Join(repo, "packages/components/active-development/kustomization.yaml"), `resources:
+  - apps/workflow-builder.yaml
+  - apps/kueue-capacity.yaml
+`)
+	mustWrite(t, filepath.Join(repo, "packages/components/active-development/apps/workflow-builder.yaml"), `apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: workflow-builder
+spec:
+  source:
+    repoURL: http://gitea-http.gitea.svc.cluster.local:3000/giteaadmin/stacks.git
+    path: packages/components/active-development/manifests/workflow-builder
+`)
+	mustWrite(t, filepath.Join(repo, "packages/components/active-development/apps/kueue-capacity.yaml"), `apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: kueue-capacity
+spec:
+  source:
+    repoURL: http://gitea-http.gitea.svc.cluster.local:3000/giteaadmin/stacks.git
+    path: packages/components/active-development/manifests/kueue-capacity
+`)
+	mustWrite(t, filepath.Join(repo, "packages/components/active-development/manifests/workflow-builder/kustomization.yaml"), `resources:
+  - ../../../shared
+  - Deployment-workflow-builder.yaml
+`)
+	mustWrite(t, filepath.Join(repo, "packages/components/active-development/manifests/workflow-builder/Deployment-workflow-builder.yaml"), "kind: Deployment\nmetadata:\n  name: workflow-builder\n")
+	mustWrite(t, filepath.Join(repo, "packages/components/active-development/manifests/kueue-capacity/kustomization.yaml"), `resources:
+  - ConfigMap-kueue-capacity.yaml
+`)
+	mustWrite(t, filepath.Join(repo, "packages/components/active-development/manifests/kueue-capacity/ConfigMap-kueue-capacity.yaml"), "kind: ConfigMap\nmetadata:\n  name: kueue-capacity\n")
+	mustWrite(t, filepath.Join(repo, "packages/components/shared/kustomization.yaml"), `resources:
+  - ConfigMap-shared.yaml
+`)
+	mustWrite(t, filepath.Join(repo, "packages/components/shared/ConfigMap-shared.yaml"), "kind: ConfigMap\nmetadata:\n  name: shared\n")
+	mustWrite(t, filepath.Join(repo, "docs/local-note.md"), "note\n")
+	return repo
+}
+
+func plannerApp(name, path string, automated bool) argoApplication {
+	app := argoApplication{}
+	app.Metadata.Name = name
+	app.Spec.Source.RepoURL = "http://gitea-http.gitea.svc.cluster.local:3000/giteaadmin/stacks.git"
+	app.Spec.Source.Path = path
+	if automated {
+		app.Spec.SyncPolicy.Automated = map[string]any{}
+	}
+	app.Status.Sync.Status = "Synced"
+	return app
 }
 
 func mustWrite(t *testing.T, path, content string) {

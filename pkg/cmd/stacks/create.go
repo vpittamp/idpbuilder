@@ -183,6 +183,7 @@ func bootstrapStacksGitOps(ctx context.Context, o *options, postDeleteCleanup *a
 	}
 	syncOptions := *o
 	syncOptions.RewriteBootstrapImagePins = o.SeedImages && o.SeedImagesMode == "release-pins"
+	syncOptions.RefreshMode = refreshModeNone
 	if err := withReadinessPhase(ctx, o, "sync-stacks-gitea", func() error {
 		_, err := sync(ctx, &syncOptions)
 		return err

@@ -40,6 +40,7 @@ const (
 	defaultBranch                     = "main"
 	defaultGiteaUser                  = "giteaadmin"
 	defaultGiteaPass                  = "developer"
+	defaultRefreshMode                = refreshModeAffected
 )
 
 type options struct {
@@ -57,6 +58,9 @@ type options struct {
 	WatchInterval     time.Duration
 	WatchDebounce     time.Duration
 	ResetLocalHistory bool
+	RefreshMode       string
+	SyncWaitTimeout   time.Duration
+	PrintRefreshPlan  bool
 	CacheDir          string
 	Recreate          bool
 
@@ -187,6 +191,9 @@ func newStacksCmd() *cobra.Command {
 	syncCmd.Flags().BoolVar(&opts.Watch, "watch", false, "continue syncing local worktree changes")
 	syncCmd.Flags().DurationVar(&opts.WatchDebounce, "debounce", opts.WatchDebounce, "debounce duration for --watch")
 	syncCmd.Flags().BoolVar(&opts.ResetLocalHistory, "reset-local-history", false, "replace the in-cluster Gitea branch history from the current snapshot")
+	syncCmd.Flags().StringVar(&opts.RefreshMode, "refresh-mode", opts.RefreshMode, "ArgoCD refresh mode after pushing: affected, all, or none")
+	syncCmd.Flags().DurationVar(&opts.SyncWaitTimeout, "sync-wait-timeout", opts.SyncWaitTimeout, "timeout for affected ArgoCD applications to observe the pushed revision")
+	syncCmd.Flags().BoolVar(&opts.PrintRefreshPlan, "print-refresh-plan", false, "print affected ArgoCD applications for current local changes without pushing or refreshing")
 	syncCmd.Flags().StringVar(&opts.CacheDir, "cache-dir", "", "persistent cache clone directory for stacks sync")
 	syncCmd.Flags().StringVar(&opts.ContainerEngine, "container-engine", opts.ContainerEngine, "container engine for stacks provider compatibility: auto, docker, or podman")
 	syncCmd.Flags().StringVar(&opts.SeedImagePushEngine, "seed-image-push-engine", opts.SeedImagePushEngine, "image push engine for bootstrap compatibility: auto, docker, or skopeo")
@@ -225,6 +232,8 @@ func defaultOptions() *options {
 		GiteaPassword:       defaultGiteaPass,
 		WatchInterval:       3 * time.Second,
 		WatchDebounce:       2 * time.Second,
+		RefreshMode:         defaultRefreshMode,
+		SyncWaitTimeout:     180 * time.Second,
 		SkipAzureCheck:      true,
 		SkipTektonBuild:     true,
 		SeedImages:          true,
@@ -294,6 +303,12 @@ func (o *options) validate() error {
 	}
 	if o.WatchDebounce <= 0 {
 		return fmt.Errorf("--debounce must be greater than 0")
+	}
+	if !validRefreshMode(o.RefreshMode) {
+		return fmt.Errorf("unsupported --refresh-mode %q; expected affected, all, or none", o.RefreshMode)
+	}
+	if o.SyncWaitTimeout <= 0 {
+		return fmt.Errorf("--sync-wait-timeout must be greater than 0")
 	}
 	if !validContainerEngine(o.ContainerEngine) {
 		return fmt.Errorf("unsupported --container-engine %q; expected auto, docker, or podman", o.ContainerEngine)

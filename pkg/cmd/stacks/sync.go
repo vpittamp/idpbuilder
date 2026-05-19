@@ -21,9 +21,14 @@ import (
 )
 
 type syncResult struct {
-	Commit string
-	Files  int
-	Noop   bool
+	Commit                string
+	ChangedFiles          []string
+	AffectedApplications  []string
+	RefreshedApplications []string
+	SkippedFiles          []string
+	ManualApplications    []string
+	UnsyncedApplications  []string
+	Noop                  bool
 }
 
 type portForward struct {
@@ -35,6 +40,9 @@ func sync(ctx context.Context, o *options) (syncResult, error) {
 	if err := ensureGitWorktree(ctx, o.StacksRepo); err != nil {
 		return syncResult{}, err
 	}
+	if o.PrintRefreshPlan {
+		return syncResult{}, printRefreshPlan(ctx, o)
+	}
 	pf, err := startGiteaPortForward(ctx)
 	if err != nil {
 		return syncResult{}, err
@@ -42,6 +50,9 @@ func sync(ctx context.Context, o *options) (syncResult, error) {
 	defer pf.stop()
 
 	if err := ensureGiteaRepository(ctx, pf.port, o); err != nil {
+		return syncResult{}, err
+	}
+	if err := ensureGiteaArgoCDWebhook(ctx, pf.port, o); err != nil {
 		return syncResult{}, err
 	}
 	result, err := pushSnapshot(ctx, pf.port, o)
@@ -52,11 +63,91 @@ func sync(ctx context.Context, o *options) (syncResult, error) {
 		fmt.Println("No changes to sync")
 		return result, nil
 	}
-	if err := refreshStackApplications(ctx, o); err != nil {
+	if err := refreshAfterSync(ctx, o, &result); err != nil {
 		return result, fmt.Errorf("synced snapshot %s but failed to refresh ArgoCD applications: %w", result.Commit, err)
 	}
-	fmt.Printf("Synced %d changed files from %s to %s/%s:%s at %s\n", result.Files, o.StacksRepo, o.GiteaOwner, o.GiteaRepo, o.Branch, result.Commit)
+	fmt.Printf("Synced %d changed files from %s to %s/%s:%s at %s\n", len(result.ChangedFiles), o.StacksRepo, o.GiteaOwner, o.GiteaRepo, o.Branch, result.Commit)
+	if len(result.AffectedApplications) == 0 && o.RefreshMode == refreshModeAffected {
+		fmt.Println("Snapshot pushed; no ArgoCD apps affected")
+	} else if len(result.RefreshedApplications) > 0 {
+		fmt.Printf("Refreshed ArgoCD applications: %s\n", strings.Join(result.RefreshedApplications, ", "))
+	}
+	if len(result.SkippedFiles) > 0 {
+		fmt.Printf("Skipped non-rendered files: %s\n", strings.Join(result.SkippedFiles, ", "))
+	}
+	if len(result.ManualApplications) > 0 {
+		fmt.Printf("Manual applications requiring operator sync: %s\n", strings.Join(result.ManualApplications, ", "))
+	}
+	if len(result.UnsyncedApplications) > 0 {
+		fmt.Printf("Applications not Synced after refresh: %s\n", strings.Join(result.UnsyncedApplications, ", "))
+	}
 	return result, nil
+}
+
+func refreshAfterSync(ctx context.Context, o *options, result *syncResult) error {
+	switch o.RefreshMode {
+	case refreshModeNone:
+		return nil
+	case refreshModeAll:
+		names, err := stackApplicationNames(ctx, o)
+		if err != nil {
+			return err
+		}
+		result.AffectedApplications = names
+		if err := refreshApplications(ctx, o, names); err != nil {
+			return err
+		}
+		result.RefreshedApplications = names
+		unsynced, err := waitForApplicationsObserved(ctx, o, names, result.Commit)
+		result.UnsyncedApplications = appendUniqueStrings(result.UnsyncedApplications, unsynced...)
+		return err
+	case refreshModeAffected:
+		apps, err := listStackApplications(ctx, o)
+		if err != nil {
+			return err
+		}
+		plan, err := planAffectedApplications(o.StacksRepo, apps, result.ChangedFiles)
+		if err != nil {
+			return err
+		}
+		applyPlanToResult(result, plan)
+		if len(plan.AffectedApplications) == 0 {
+			return nil
+		}
+		if plan.RootFirst {
+			if err := refreshApplications(ctx, o, []string{rootApplicationName}); err != nil {
+				return err
+			}
+			result.RefreshedApplications = appendUniqueStrings(result.RefreshedApplications, rootApplicationName)
+			unsynced, err := waitForApplicationsObserved(ctx, o, []string{rootApplicationName}, result.Commit)
+			result.UnsyncedApplications = appendUniqueStrings(result.UnsyncedApplications, unsynced...)
+			if err != nil {
+				return err
+			}
+			apps, err = listStackApplications(ctx, o)
+			if err != nil {
+				return err
+			}
+			plan, err = planAffectedApplications(o.StacksRepo, apps, result.ChangedFiles)
+			if err != nil {
+				return err
+			}
+			applyPlanToResult(result, plan)
+		}
+		children := withoutString(plan.AffectedApplications, rootApplicationName)
+		if len(children) == 0 {
+			return nil
+		}
+		if err := refreshApplications(ctx, o, children); err != nil {
+			return err
+		}
+		result.RefreshedApplications = appendUniqueStrings(result.RefreshedApplications, children...)
+		unsynced, err := waitForApplicationsObserved(ctx, o, children, result.Commit)
+		result.UnsyncedApplications = appendUniqueStrings(result.UnsyncedApplications, unsynced...)
+		return err
+	default:
+		return fmt.Errorf("unsupported refresh mode %q", o.RefreshMode)
+	}
 }
 
 func ensureGitWorktree(ctx context.Context, repo string) error {
@@ -209,6 +300,97 @@ func giteaRepositoryExists(ctx context.Context, port int, o *options) (bool, err
 	}
 }
 
+type giteaHook struct {
+	ID     int               `json:"id"`
+	Type   string            `json:"type"`
+	Active bool              `json:"active"`
+	Events []string          `json:"events"`
+	Config map[string]string `json:"config"`
+}
+
+func ensureGiteaArgoCDWebhook(ctx context.Context, port int, o *options) error {
+	const webhookURL = "http://argocd-server.argocd.svc.cluster.local/api/webhook"
+	hooks, err := listGiteaSystemHooks(ctx, port, o)
+	if err != nil {
+		return err
+	}
+	for _, hook := range hooks {
+		if hook.Config["url"] != webhookURL {
+			continue
+		}
+		if hook.Active && hookHasEvent(hook, "push") {
+			return nil
+		}
+		return fmt.Errorf("Gitea ArgoCD system webhook %d targets %s but is inactive or missing push events", hook.ID, webhookURL)
+	}
+	return createGiteaArgoCDWebhook(ctx, port, o, webhookURL)
+}
+
+func listGiteaSystemHooks(ctx context.Context, port int, o *options) ([]giteaHook, error) {
+	endpoint := fmt.Sprintf("http://127.0.0.1:%d/api/v1/admin/hooks", port)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
+	if err != nil {
+		return nil, err
+	}
+	req.SetBasicAuth(o.GiteaUser, o.GiteaPassword)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("checking Gitea system webhooks: %w", err)
+	}
+	defer resp.Body.Close()
+	data, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return nil, fmt.Errorf("checking Gitea system webhooks returned %s: %s", resp.Status, strings.TrimSpace(string(data)))
+	}
+	var hooks []giteaHook
+	if err := json.Unmarshal(data, &hooks); err != nil {
+		return nil, fmt.Errorf("parsing Gitea system webhooks: %w", err)
+	}
+	return hooks, nil
+}
+
+func createGiteaArgoCDWebhook(ctx context.Context, port int, o *options, webhookURL string) error {
+	body, err := json.Marshal(map[string]any{
+		"type":   "gitea",
+		"active": true,
+		"events": []string{"push"},
+		"config": map[string]string{
+			"url":               webhookURL,
+			"content_type":      "json",
+			"is_system_webhook": "true",
+		},
+	})
+	if err != nil {
+		return err
+	}
+	endpoint := fmt.Sprintf("http://127.0.0.1:%d/api/v1/admin/hooks", port)
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, strings.NewReader(string(body)))
+	if err != nil {
+		return err
+	}
+	req.SetBasicAuth(o.GiteaUser, o.GiteaPassword)
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return fmt.Errorf("creating Gitea ArgoCD system webhook: %w", err)
+	}
+	defer resp.Body.Close()
+	data, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+	if resp.StatusCode >= 200 && resp.StatusCode < 300 {
+		return nil
+	}
+	return fmt.Errorf("creating Gitea ArgoCD system webhook returned %s: %s", resp.Status, strings.TrimSpace(string(data)))
+}
+
+func hookHasEvent(hook giteaHook, event string) bool {
+	for _, candidate := range hook.Events {
+		if candidate == event {
+			return true
+		}
+	}
+	return false
+}
+
 func pushSnapshot(ctx context.Context, port int, o *options) (syncResult, error) {
 	return pushSnapshotToRemote(ctx, giteaRemoteURL(port, o), o)
 }
@@ -269,7 +451,7 @@ func pushSnapshotToRemote(ctx context.Context, remote string, o *options) (syncR
 		}
 		return syncResult{}, err
 	}
-	return syncResult{Commit: strings.TrimSpace(commit), Files: len(changed)}, nil
+	return syncResult{Commit: strings.TrimSpace(commit), ChangedFiles: changed}, nil
 }
 
 func syncCachePath(o *options) (string, error) {
@@ -583,13 +765,28 @@ type argoApplication struct {
 		Name string `json:"name"`
 	} `json:"metadata"`
 	Spec struct {
-		Source  argoApplicationSource   `json:"source"`
-		Sources []argoApplicationSource `json:"sources"`
+		Source     argoApplicationSource   `json:"source"`
+		Sources    []argoApplicationSource `json:"sources"`
+		SyncPolicy struct {
+			Automated map[string]any `json:"automated"`
+		} `json:"syncPolicy"`
 	} `json:"spec"`
+	Status struct {
+		Sync struct {
+			Status    string   `json:"status"`
+			Revision  string   `json:"revision"`
+			Revisions []string `json:"revisions"`
+		} `json:"sync"`
+		OperationState struct {
+			Phase string `json:"phase"`
+		} `json:"operationState"`
+	} `json:"status"`
 }
 
 type argoApplicationSource struct {
-	RepoURL string `json:"repoURL"`
+	RepoURL        string `json:"repoURL"`
+	Path           string `json:"path"`
+	TargetRevision string `json:"targetRevision"`
 }
 
 func refreshStackApplications(ctx context.Context, o *options) error {
@@ -597,7 +794,10 @@ func refreshStackApplications(ctx context.Context, o *options) error {
 	if err != nil {
 		return err
 	}
+	return refreshApplications(ctx, o, names)
+}
 
+func refreshApplications(ctx context.Context, o *options, names []string) error {
 	var errs []error
 	for _, name := range names {
 		if err := run(ctx, o.StacksRepo, withStacksEnv(o), "kubectl", "annotate", "application", name, "-n", "argocd", "argocd.argoproj.io/refresh=hard", "--overwrite"); err != nil {
@@ -608,21 +808,48 @@ func refreshStackApplications(ctx context.Context, o *options) error {
 }
 
 func stackApplicationNames(ctx context.Context, o *options) ([]string, error) {
-	raw, err := output(ctx, o.StacksRepo, withStacksEnv(o), "kubectl", "get", "application", "-n", "argocd", "-o", "json")
+	apps, err := listStackApplications(ctx, o)
 	if err != nil {
 		return nil, err
 	}
-	var apps argoApplicationList
-	if err := json.Unmarshal([]byte(raw), &apps); err != nil {
-		return nil, fmt.Errorf("parsing ArgoCD applications: %w", err)
-	}
-
 	suffix := fmt.Sprintf("/%s/%s.git", o.GiteaOwner, o.GiteaRepo)
 	names := matchingStackApplicationNames(apps, suffix)
 	if len(names) == 0 {
 		return nil, fmt.Errorf("no ArgoCD applications source repo %s", suffix)
 	}
 	return names, nil
+}
+
+func listStackApplications(ctx context.Context, o *options) (argoApplicationList, error) {
+	raw, err := output(ctx, o.StacksRepo, withStacksEnv(o), "kubectl", "get", "application", "-n", "argocd", "-o", "json")
+	if err != nil {
+		return argoApplicationList{}, err
+	}
+	var apps argoApplicationList
+	if err := json.Unmarshal([]byte(raw), &apps); err != nil {
+		return argoApplicationList{}, fmt.Errorf("parsing ArgoCD applications: %w", err)
+	}
+	suffix := fmt.Sprintf("/%s/%s.git", o.GiteaOwner, o.GiteaRepo)
+	filtered := argoApplicationList{}
+	for _, app := range apps.Items {
+		if applicationUsesRepo(app, suffix) {
+			if !repoURLMatches(app.Spec.Source.RepoURL, suffix) {
+				app.Spec.Source = argoApplicationSource{}
+			}
+			localSources := make([]argoApplicationSource, 0, len(app.Spec.Sources))
+			for _, source := range app.Spec.Sources {
+				if repoURLMatches(source.RepoURL, suffix) {
+					localSources = append(localSources, source)
+				}
+			}
+			app.Spec.Sources = localSources
+			filtered.Items = append(filtered.Items, app)
+		}
+	}
+	if len(filtered.Items) == 0 {
+		return argoApplicationList{}, fmt.Errorf("no ArgoCD applications source repo %s", suffix)
+	}
+	return filtered, nil
 }
 
 func matchingStackApplicationNames(apps argoApplicationList, suffix string) []string {
@@ -658,4 +885,51 @@ func applicationUsesRepo(app argoApplication, repoSuffix string) bool {
 func repoURLMatches(repoURL, repoSuffix string) bool {
 	normalized := strings.TrimSuffix(strings.TrimSpace(repoURL), "/")
 	return normalized == strings.TrimPrefix(repoSuffix, "/") || strings.HasSuffix(normalized, repoSuffix)
+}
+
+func (app argoApplication) localSources() []argoApplicationSource {
+	sources := make([]argoApplicationSource, 0, 1+len(app.Spec.Sources))
+	if app.Spec.Source.RepoURL != "" {
+		sources = append(sources, app.Spec.Source)
+	}
+	sources = append(sources, app.Spec.Sources...)
+	return sources
+}
+
+func applyPlanToResult(result *syncResult, plan refreshPlan) {
+	result.AffectedApplications = appendUniqueStrings(result.AffectedApplications, plan.AffectedApplications...)
+	result.SkippedFiles = appendUniqueStrings(result.SkippedFiles, plan.SkippedFiles...)
+	result.ManualApplications = appendUniqueStrings(result.ManualApplications, plan.ManualApplications...)
+	result.UnsyncedApplications = appendUniqueStrings(result.UnsyncedApplications, plan.UnsyncedApplications...)
+}
+
+func appendUniqueStrings(base []string, values ...string) []string {
+	seen := map[string]bool{}
+	out := make([]string, 0, len(base)+len(values))
+	for _, value := range base {
+		if value == "" || seen[value] {
+			continue
+		}
+		seen[value] = true
+		out = append(out, value)
+	}
+	for _, value := range values {
+		if value == "" || seen[value] {
+			continue
+		}
+		seen[value] = true
+		out = append(out, value)
+	}
+	sort.Strings(out)
+	return out
+}
+
+func withoutString(values []string, drop string) []string {
+	out := make([]string, 0, len(values))
+	for _, value := range values {
+		if value != drop {
+			out = append(out, value)
+		}
+	}
+	return out
 }
