@@ -60,9 +60,9 @@ func status(ctx context.Context, o *options) error {
 	snapshot := ""
 	if commit, err := latestGiteaCommit(ctx, o); err == nil {
 		snapshot = commit
-		fmt.Printf("Last Gitea snapshot: %s\n", commit)
+		fmt.Printf("Latest Gitea snapshot: %s\n", commit)
 	} else {
-		fmt.Printf("Last Gitea snapshot: unavailable\n")
+		fmt.Printf("Latest Gitea snapshot: unavailable\n")
 	}
 	var hook giteaWebhookStatus
 	hookAvailable := false
@@ -100,14 +100,13 @@ type stackAppProblem struct {
 }
 
 func printHotLoopReadiness(snapshot, rootRevision string, hook giteaWebhookStatus, hookAvailable bool, apps argoApplicationList, appsErr error) {
-	rootObserved := snapshot != "" && revisionMatches(rootRevision, snapshot)
 	problems := unhealthyStackApplications(apps)
 	verdict := hotLoopReadinessVerdict(snapshot, rootRevision, hook, hookAvailable, appsErr, problems)
 	fmt.Println("Hot loop readiness:")
-	if snapshot == "" || rootRevision == "" {
-		fmt.Println("  Snapshot observed by root: unavailable")
-	} else {
-		fmt.Printf("  Snapshot observed by root: %t\n", rootObserved)
+	rootMatch, rootLag := rootRevisionMatchStatus(snapshot, rootRevision)
+	fmt.Printf("  Root revision matches latest snapshot: %s\n", rootMatch)
+	if rootLag != "" {
+		fmt.Printf("  Root revision lag: %s\n", rootLag)
 	}
 	if appsErr != nil {
 		fmt.Printf("  Stack applications: unavailable (%v)\n", appsErr)
@@ -122,6 +121,16 @@ func printHotLoopReadiness(snapshot, rootRevision string, hook giteaWebhookStatu
 		}
 	}
 	fmt.Printf("  Verdict: %s\n", verdict)
+}
+
+func rootRevisionMatchStatus(snapshot, rootRevision string) (string, string) {
+	if snapshot == "" || rootRevision == "" {
+		return "unavailable", ""
+	}
+	if revisionMatches(rootRevision, snapshot) {
+		return "true", ""
+	}
+	return "false", "acceptable for child-only syncs"
 }
 
 func hotLoopReadinessVerdict(snapshot, rootRevision string, hook giteaWebhookStatus, hookAvailable bool, appsErr error, problems []stackAppProblem) string {

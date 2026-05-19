@@ -63,6 +63,23 @@ func TestHotLoopReadinessVerdict(t *testing.T) {
 	}
 }
 
+func TestRootRevisionMatchStatus(t *testing.T) {
+	match, lag := rootRevisionMatchStatus("abcdef", "abcdef")
+	if match != "true" || lag != "" {
+		t.Fatalf("matching root revision status mismatch: match=%q lag=%q", match, lag)
+	}
+
+	match, lag = rootRevisionMatchStatus("abcdef", "old")
+	if match != "false" || lag != "acceptable for child-only syncs" {
+		t.Fatalf("child-only root lag status mismatch: match=%q lag=%q", match, lag)
+	}
+
+	match, lag = rootRevisionMatchStatus("", "abcdef")
+	if match != "unavailable" || lag != "" {
+		t.Fatalf("unavailable root revision status mismatch: match=%q lag=%q", match, lag)
+	}
+}
+
 func TestUnhealthyStackApplications(t *testing.T) {
 	healthy := argoApplication{}
 	healthy.Metadata.Name = "healthy"
