@@ -442,8 +442,15 @@ func withStacksEnv(o *options, extra ...string) []string {
 }
 
 func watchAndSync(ctx context.Context, o *options) error {
-	fmt.Printf("Watching %s for stacks changes with %s debounce\n", o.StacksRepo, o.WatchDebounce)
-	last, err := snapshotHash(ctx, o.StacksRepo)
+	return watchAndSyncWithFuncs(ctx, o, snapshotHash, sync)
+}
+
+type watchHashFunc func(context.Context, string) (string, error)
+type watchSyncFunc func(context.Context, *options) (syncResult, error)
+
+func watchAndSyncWithFuncs(ctx context.Context, o *options, hashFunc watchHashFunc, syncFunc watchSyncFunc) error {
+	fmt.Printf("Watch started: repo=%s debounce=%s\n", o.StacksRepo, o.WatchDebounce)
+	last, err := hashFunc(ctx, o.StacksRepo)
 	if err != nil {
 		return err
 	}
@@ -455,35 +462,55 @@ func watchAndSync(ctx context.Context, o *options) error {
 	defer ticker.Stop()
 	var pending string
 	var lastChange time.Time
+	failures := 0
 	for {
 		select {
 		case <-ctx.Done():
 			return context.Cause(ctx)
 		case <-ticker.C:
-			hash, err := snapshotHash(ctx, o.StacksRepo)
+			hash, err := hashFunc(ctx, o.StacksRepo)
 			if err != nil {
 				return err
 			}
 			if pending != "" && hash == last {
+				fmt.Println("No changes to sync")
 				pending = ""
 				continue
 			}
 			if hash != last && hash != pending {
 				pending = hash
 				lastChange = time.Now()
+				fmt.Printf("Change detected: debounce=%s\n", o.WatchDebounce)
 				continue
 			}
 			if pending == "" || time.Since(lastChange) < o.WatchDebounce {
 				continue
 			}
-			if _, err := sync(ctx, o); err != nil {
-				return err
+			fmt.Println("Sync started")
+			result, err := syncFunc(ctx, o)
+			if err != nil {
+				failures++
+				fmt.Printf("Sync failed; retrying: failures=%d error=%v\n", failures, err)
+				lastChange = time.Now()
+				continue
 			}
-			last, err = snapshotHash(ctx, o.StacksRepo)
+			last, err = hashFunc(ctx, o.StacksRepo)
 			if err != nil {
 				return err
 			}
 			pending = ""
+			failures = 0
+			if result.Noop {
+				fmt.Println("No changes to sync")
+			} else {
+				fmt.Printf("Sync completed: commit=%s changed=%d affected=%d refreshed=%d total=%s\n",
+					shortRevision(result.Commit),
+					len(result.ChangedFiles),
+					len(result.AffectedApplications),
+					len(result.RefreshedApplications),
+					roundDuration(result.Timings.TotalDuration),
+				)
+			}
 		}
 	}
 }

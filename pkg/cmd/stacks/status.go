@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"sort"
 	"strings"
 )
 
@@ -39,23 +40,35 @@ func status(ctx context.Context, o *options) error {
 	}{
 		{"Root app sync", "{.status.sync.status}"},
 		{"Root app health", "{.status.health.status}"},
+		{"Root app revision", "{.status.sync.revision}"},
 		{"Root app repo", "{.spec.source.repoURL}"},
 		{"Root app target", "{.spec.source.targetRevision}"},
 	}
+	rootRevision := ""
 	for _, item := range appJSONPaths {
 		out, err := output(ctx, o.StacksRepo, withStacksEnv(o), "kubectl", "get", "application", "root-application", "-n", "argocd", "-o", "jsonpath="+item.path)
 		if err != nil {
 			fmt.Printf("%s: unavailable\n", item.label)
 			continue
 		}
-		fmt.Printf("%s: %s\n", item.label, strings.TrimSpace(out))
+		value := strings.TrimSpace(out)
+		if item.label == "Root app revision" {
+			rootRevision = value
+		}
+		fmt.Printf("%s: %s\n", item.label, value)
 	}
+	snapshot := ""
 	if commit, err := latestGiteaCommit(ctx, o); err == nil {
+		snapshot = commit
 		fmt.Printf("Last Gitea snapshot: %s\n", commit)
 	} else {
 		fmt.Printf("Last Gitea snapshot: unavailable\n")
 	}
-	if hook, err := giteaArgoCDWebhookStatus(ctx, o); err == nil {
+	var hook giteaWebhookStatus
+	hookAvailable := false
+	if currentHook, err := giteaArgoCDWebhookStatus(ctx, o); err == nil {
+		hook = currentHook
+		hookAvailable = true
 		if hook.Ready {
 			fmt.Printf("Gitea ArgoCD webhook: ready (id=%d url=%s)\n", hook.ID, hook.URL)
 		} else {
@@ -64,6 +77,8 @@ func status(ctx context.Context, o *options) error {
 	} else {
 		fmt.Printf("Gitea ArgoCD webhook: unavailable (%v)\n", err)
 	}
+	apps, appsErr := listStackApplications(ctx, o)
+	printHotLoopReadiness(snapshot, rootRevision, hook, hookAvailable, apps, appsErr)
 
 	if out, err := output(ctx, o.StacksRepo, withStacksEnv(o), "kubectl", "get", "pods", "-n", "gitea", "--no-headers"); err == nil {
 		fmt.Printf("Gitea pods:\n%s", out)
@@ -76,6 +91,70 @@ func status(ctx context.Context, o *options) error {
 		fmt.Printf("ArgoCD pods: unavailable\n")
 	}
 	return nil
+}
+
+type stackAppProblem struct {
+	Name   string
+	Sync   string
+	Health string
+}
+
+func printHotLoopReadiness(snapshot, rootRevision string, hook giteaWebhookStatus, hookAvailable bool, apps argoApplicationList, appsErr error) {
+	rootObserved := snapshot != "" && revisionMatches(rootRevision, snapshot)
+	problems := unhealthyStackApplications(apps)
+	verdict := hotLoopReadinessVerdict(snapshot, rootRevision, hook, hookAvailable, appsErr, problems)
+	fmt.Println("Hot loop readiness:")
+	if snapshot == "" || rootRevision == "" {
+		fmt.Println("  Snapshot observed by root: unavailable")
+	} else {
+		fmt.Printf("  Snapshot observed by root: %t\n", rootObserved)
+	}
+	if appsErr != nil {
+		fmt.Printf("  Stack applications: unavailable (%v)\n", appsErr)
+	} else {
+		fmt.Printf("  Stack applications: %d total, %d degraded\n", len(apps.Items), len(problems))
+		for i, app := range problems {
+			if i >= 5 {
+				fmt.Printf("  Additional degraded applications: %d\n", len(problems)-i)
+				break
+			}
+			fmt.Printf("  Degraded application: %s sync=%s health=%s\n", app.Name, app.Sync, app.Health)
+		}
+	}
+	fmt.Printf("  Verdict: %s\n", verdict)
+}
+
+func hotLoopReadinessVerdict(snapshot, rootRevision string, hook giteaWebhookStatus, hookAvailable bool, appsErr error, problems []stackAppProblem) string {
+	if snapshot == "" || rootRevision == "" || !hookAvailable || appsErr != nil {
+		return "Hot loop unavailable"
+	}
+	if !revisionMatches(rootRevision, snapshot) || !hook.Ready || len(problems) > 0 {
+		return "Hot loop degraded"
+	}
+	return "Hot loop ready"
+}
+
+func unhealthyStackApplications(apps argoApplicationList) []stackAppProblem {
+	problems := make([]stackAppProblem, 0)
+	for _, app := range apps.Items {
+		syncStatus := strings.TrimSpace(app.Status.Sync.Status)
+		healthStatus := strings.TrimSpace(app.Status.Health.Status)
+		if syncStatus == "" {
+			syncStatus = "Unknown"
+		}
+		if healthStatus == "" {
+			healthStatus = "Unknown"
+		}
+		if syncStatus != "Synced" || healthStatus != "Healthy" {
+			problems = append(problems, stackAppProblem{
+				Name:   app.Metadata.Name,
+				Sync:   syncStatus,
+				Health: healthStatus,
+			})
+		}
+	}
+	sort.Slice(problems, func(i, j int) bool { return problems[i].Name < problems[j].Name })
+	return problems
 }
 
 func giteaArgoCDWebhookStatus(ctx context.Context, o *options) (giteaWebhookStatus, error) {

@@ -1225,6 +1225,9 @@ type argoApplication struct {
 			Revision  string   `json:"revision"`
 			Revisions []string `json:"revisions"`
 		} `json:"sync"`
+		Health struct {
+			Status string `json:"status"`
+		} `json:"health"`
 		OperationState struct {
 			Phase string `json:"phase"`
 		} `json:"operationState"`
