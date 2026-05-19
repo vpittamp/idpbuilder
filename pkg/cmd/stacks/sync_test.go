@@ -455,6 +455,127 @@ func TestMatchingStackApplicationNamesReturnsEmptyWhenNoAppsMatch(t *testing.T) 
 	}
 }
 
+func TestDefaultSyncPollIntervalValidatesPositive(t *testing.T) {
+	o := defaultOptions()
+	if o.SyncPollInterval != defaultSyncPollInterval {
+		t.Fatalf("default sync poll interval = %s, want %s", o.SyncPollInterval, defaultSyncPollInterval)
+	}
+
+	o.StacksRepo = t.TempDir()
+	o.SyncPollInterval = 0
+	if err := o.validate(); err == nil || !strings.Contains(err.Error(), "--sync-poll-interval") {
+		t.Fatalf("expected sync-poll-interval validation error, got %v", err)
+	}
+}
+
+func TestClassifyGiteaArgoCDWebhook(t *testing.T) {
+	ready := classifyGiteaArgoCDWebhook([]giteaHook{{
+		ID:     1,
+		Active: true,
+		Events: []string{"push"},
+		Config: map[string]string{"url": giteaArgoCDWebhookURL},
+	}})
+	if !ready.Ready || !ready.Exists {
+		t.Fatalf("expected ready webhook, got %#v", ready)
+	}
+
+	inactive := classifyGiteaArgoCDWebhook([]giteaHook{{
+		ID:     2,
+		Active: false,
+		Events: []string{"push"},
+		Config: map[string]string{"url": giteaArgoCDWebhookURL},
+	}})
+	if inactive.Ready || !strings.Contains(inactive.Message, "inactive") {
+		t.Fatalf("expected inactive webhook status, got %#v", inactive)
+	}
+
+	missingPush := classifyGiteaArgoCDWebhook([]giteaHook{{
+		ID:     3,
+		Active: true,
+		Events: []string{"pull_request"},
+		Config: map[string]string{"url": giteaArgoCDWebhookURL},
+	}})
+	if missingPush.Ready || !strings.Contains(missingPush.Message, "missing push") {
+		t.Fatalf("expected missing push webhook status, got %#v", missingPush)
+	}
+
+	missing := classifyGiteaArgoCDWebhook(nil)
+	if missing.Ready || missing.Exists || missing.Message != "missing" {
+		t.Fatalf("expected missing webhook status, got %#v", missing)
+	}
+}
+
+func TestWaitForApplicationsObservedUsesConfiguredPollInterval(t *testing.T) {
+	ctx := context.Background()
+	repo := t.TempDir()
+	binDir := t.TempDir()
+	countPath := filepath.Join(t.TempDir(), "count")
+	commit := "1234567890abcdef"
+	kubectl := filepath.Join(binDir, "kubectl")
+	mustWrite(t, kubectl, `#!/usr/bin/env bash
+set -euo pipefail
+count_file="${TEST_KUBECTL_COUNT}"
+commit="${TEST_COMMIT}"
+count="$(cat "$count_file" 2>/dev/null || echo 0)"
+count="$((count + 1))"
+echo "$count" > "$count_file"
+revision="old"
+if [[ "$count" -ge 3 ]]; then
+  revision="$commit"
+fi
+cat <<JSON
+{"items":[{"metadata":{"name":"workflow-builder"},"status":{"sync":{"status":"Synced","revision":"${revision}"},"operationState":{"phase":"Succeeded"}}}]}
+JSON
+`)
+	if err := os.Chmod(kubectl, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	t.Setenv("TEST_KUBECTL_COUNT", countPath)
+	t.Setenv("TEST_COMMIT", commit)
+
+	opts := testSyncOptions(t, repo)
+	opts.SyncWaitTimeout = time.Second
+	opts.SyncPollInterval = 10 * time.Millisecond
+	unsynced, err := waitForApplicationsObserved(ctx, opts, []string{"workflow-builder"}, commit)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(unsynced) != 0 {
+		t.Fatalf("expected no unsynced apps, got %v", unsynced)
+	}
+	count := strings.TrimSpace(gitOutputTest(t, filepath.Dir(countPath), "cat", countPath))
+	if count != "3" {
+		t.Fatalf("expected three polls, got %s", count)
+	}
+}
+
+func TestWaitForApplicationsObservedTimeoutReportsPendingRevision(t *testing.T) {
+	ctx := context.Background()
+	repo := t.TempDir()
+	binDir := t.TempDir()
+	commit := "1234567890abcdef"
+	kubectl := filepath.Join(binDir, "kubectl")
+	mustWrite(t, kubectl, `#!/usr/bin/env bash
+set -euo pipefail
+cat <<JSON
+{"items":[{"metadata":{"name":"workflow-builder"},"status":{"sync":{"status":"Synced","revision":"old"},"operationState":{"phase":"Succeeded"}}}]}
+JSON
+`)
+	if err := os.Chmod(kubectl, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	opts := testSyncOptions(t, repo)
+	opts.SyncWaitTimeout = 25 * time.Millisecond
+	opts.SyncPollInterval = 5 * time.Millisecond
+	_, err := waitForApplicationsObserved(ctx, opts, []string{"workflow-builder"}, commit)
+	if err == nil || !strings.Contains(err.Error(), "workflow-builder (revision old)") {
+		t.Fatalf("expected pending revision timeout, got %v", err)
+	}
+}
+
 func TestRefreshAllRefreshesRootThenCurrentLiveChildren(t *testing.T) {
 	ctx := context.Background()
 	repo := t.TempDir()
@@ -525,6 +646,7 @@ exit 64
 	opts := testSyncOptions(t, repo)
 	opts.RefreshMode = refreshModeAll
 	opts.SyncWaitTimeout = time.Second
+	opts.SyncPollInterval = 10 * time.Millisecond
 	result := syncResult{Commit: commit}
 	if err := refreshAfterSync(ctx, opts, &result); err != nil {
 		t.Fatal(err)

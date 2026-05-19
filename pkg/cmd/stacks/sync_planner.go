@@ -483,9 +483,16 @@ func waitForApplicationsObserved(ctx context.Context, o *options, names []string
 		select {
 		case <-ctx.Done():
 			return unsyncedApplications(last, names), context.Cause(ctx)
-		case <-time.After(2 * time.Second):
+		case <-time.After(syncPollInterval(o)):
 		}
 	}
+}
+
+func syncPollInterval(o *options) time.Duration {
+	if o == nil || o.SyncPollInterval <= 0 {
+		return defaultSyncPollInterval
+	}
+	return o.SyncPollInterval
 }
 
 func getApplicationsByName(ctx context.Context, o *options, names []string) (map[string]argoApplication, error) {

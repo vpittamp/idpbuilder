@@ -20,6 +20,8 @@ import (
 	"time"
 )
 
+const giteaArgoCDWebhookURL = "http://argocd-server.argocd.svc.cluster.local/api/webhook"
+
 type syncResult struct {
 	Commit                string
 	ChangedFiles          []string
@@ -28,7 +30,15 @@ type syncResult struct {
 	SkippedFiles          []string
 	ManualApplications    []string
 	UnsyncedApplications  []string
+	Timings               syncTimings
 	Noop                  bool
+}
+
+type syncTimings struct {
+	PushDuration    time.Duration
+	RefreshDuration time.Duration
+	WaitDuration    time.Duration
+	TotalDuration   time.Duration
 }
 
 type portForward struct {
@@ -37,6 +47,7 @@ type portForward struct {
 }
 
 func sync(ctx context.Context, o *options) (syncResult, error) {
+	start := time.Now()
 	if err := ensureGitWorktree(ctx, o.StacksRepo); err != nil {
 		return syncResult{}, err
 	}
@@ -55,17 +66,22 @@ func sync(ctx context.Context, o *options) (syncResult, error) {
 	if err := ensureGiteaArgoCDWebhook(ctx, pf.port, o); err != nil {
 		return syncResult{}, err
 	}
+	pushStart := time.Now()
 	result, err := pushSnapshot(ctx, pf.port, o)
 	if err != nil {
 		return syncResult{}, err
 	}
+	result.Timings.PushDuration = time.Since(pushStart)
 	if result.Noop {
+		result.Timings.TotalDuration = time.Since(start)
 		fmt.Println("No changes to sync")
 		return result, nil
 	}
 	if err := refreshAfterSync(ctx, o, &result); err != nil {
+		result.Timings.TotalDuration = time.Since(start)
 		return result, fmt.Errorf("synced snapshot %s but failed to refresh ArgoCD applications: %w", result.Commit, err)
 	}
+	result.Timings.TotalDuration = time.Since(start)
 	fmt.Printf("Synced %d changed files from %s to %s/%s:%s at %s\n", len(result.ChangedFiles), o.StacksRepo, o.GiteaOwner, o.GiteaRepo, o.Branch, result.Commit)
 	if len(result.AffectedApplications) == 0 && o.RefreshMode == refreshModeAffected {
 		fmt.Println("Snapshot pushed; no ArgoCD apps affected")
@@ -81,7 +97,24 @@ func sync(ctx context.Context, o *options) (syncResult, error) {
 	if len(result.UnsyncedApplications) > 0 {
 		fmt.Printf("Applications not Synced after refresh: %s\n", strings.Join(result.UnsyncedApplications, ", "))
 	}
+	printSyncTimings(result.Timings)
 	return result, nil
+}
+
+func printSyncTimings(t syncTimings) {
+	fmt.Printf("Sync timings: push=%s refresh=%s wait=%s total=%s\n",
+		roundDuration(t.PushDuration),
+		roundDuration(t.RefreshDuration),
+		roundDuration(t.WaitDuration),
+		roundDuration(t.TotalDuration),
+	)
+}
+
+func roundDuration(value time.Duration) time.Duration {
+	if value <= 0 {
+		return 0
+	}
+	return value.Round(time.Millisecond)
 }
 
 func refreshAfterSync(ctx context.Context, o *options, result *syncResult) error {
@@ -96,20 +129,20 @@ func refreshAfterSync(ctx context.Context, o *options, result *syncResult) error
 		names := stackApplicationNamesFromList(apps)
 		result.AffectedApplications = appendUniqueStrings(result.AffectedApplications, names...)
 		if !containsString(names, rootApplicationName) {
-			if err := refreshApplications(ctx, o, names); err != nil {
+			if err := timedRefreshApplications(ctx, o, result, names); err != nil {
 				return err
 			}
 			result.RefreshedApplications = appendUniqueStrings(result.RefreshedApplications, names...)
-			unsynced, err := waitForApplicationsObserved(ctx, o, names, result.Commit)
+			unsynced, err := timedWaitForApplicationsObserved(ctx, o, result, names)
 			result.UnsyncedApplications = appendUniqueStrings(result.UnsyncedApplications, unsynced...)
 			return err
 		}
 
-		if err := refreshApplications(ctx, o, []string{rootApplicationName}); err != nil {
+		if err := timedRefreshApplications(ctx, o, result, []string{rootApplicationName}); err != nil {
 			return err
 		}
 		result.RefreshedApplications = appendUniqueStrings(result.RefreshedApplications, rootApplicationName)
-		unsynced, err := waitForApplicationsObserved(ctx, o, []string{rootApplicationName}, result.Commit)
+		unsynced, err := timedWaitForApplicationsObserved(ctx, o, result, []string{rootApplicationName})
 		result.UnsyncedApplications = appendUniqueStrings(result.UnsyncedApplications, unsynced...)
 		if err != nil {
 			return err
@@ -124,11 +157,11 @@ func refreshAfterSync(ctx context.Context, o *options, result *syncResult) error
 		if len(children) == 0 {
 			return nil
 		}
-		if err := refreshApplications(ctx, o, children); err != nil {
+		if err := timedRefreshApplications(ctx, o, result, children); err != nil {
 			return err
 		}
 		result.RefreshedApplications = appendUniqueStrings(result.RefreshedApplications, children...)
-		unsynced, err = waitForApplicationsObserved(ctx, o, children, result.Commit)
+		unsynced, err = timedWaitForApplicationsObserved(ctx, o, result, children)
 		result.UnsyncedApplications = appendUniqueStrings(result.UnsyncedApplications, unsynced...)
 		return err
 	case refreshModeAffected:
@@ -145,11 +178,11 @@ func refreshAfterSync(ctx context.Context, o *options, result *syncResult) error
 			return nil
 		}
 		if plan.RootFirst {
-			if err := refreshApplications(ctx, o, []string{rootApplicationName}); err != nil {
+			if err := timedRefreshApplications(ctx, o, result, []string{rootApplicationName}); err != nil {
 				return err
 			}
 			result.RefreshedApplications = appendUniqueStrings(result.RefreshedApplications, rootApplicationName)
-			unsynced, err := waitForApplicationsObserved(ctx, o, []string{rootApplicationName}, result.Commit)
+			unsynced, err := timedWaitForApplicationsObserved(ctx, o, result, []string{rootApplicationName})
 			result.UnsyncedApplications = appendUniqueStrings(result.UnsyncedApplications, unsynced...)
 			if err != nil {
 				return err
@@ -168,16 +201,30 @@ func refreshAfterSync(ctx context.Context, o *options, result *syncResult) error
 		if len(children) == 0 {
 			return nil
 		}
-		if err := refreshApplications(ctx, o, children); err != nil {
+		if err := timedRefreshApplications(ctx, o, result, children); err != nil {
 			return err
 		}
 		result.RefreshedApplications = appendUniqueStrings(result.RefreshedApplications, children...)
-		unsynced, err := waitForApplicationsObserved(ctx, o, children, result.Commit)
+		unsynced, err := timedWaitForApplicationsObserved(ctx, o, result, children)
 		result.UnsyncedApplications = appendUniqueStrings(result.UnsyncedApplications, unsynced...)
 		return err
 	default:
 		return fmt.Errorf("unsupported refresh mode %q", o.RefreshMode)
 	}
+}
+
+func timedRefreshApplications(ctx context.Context, o *options, result *syncResult, names []string) error {
+	start := time.Now()
+	err := refreshApplications(ctx, o, names)
+	result.Timings.RefreshDuration += time.Since(start)
+	return err
+}
+
+func timedWaitForApplicationsObserved(ctx context.Context, o *options, result *syncResult, names []string) ([]string, error) {
+	start := time.Now()
+	unsynced, err := waitForApplicationsObserved(ctx, o, names, result.Commit)
+	result.Timings.WaitDuration += time.Since(start)
+	return unsynced, err
 }
 
 func ensureGitWorktree(ctx context.Context, repo string) error {
@@ -339,21 +386,53 @@ type giteaHook struct {
 }
 
 func ensureGiteaArgoCDWebhook(ctx context.Context, port int, o *options) error {
-	const webhookURL = "http://argocd-server.argocd.svc.cluster.local/api/webhook"
 	hooks, err := listGiteaSystemHooks(ctx, port, o)
 	if err != nil {
 		return err
 	}
+	status := classifyGiteaArgoCDWebhook(hooks)
+	if status.Ready {
+		return nil
+	}
+	if status.Exists {
+		return fmt.Errorf("Gitea ArgoCD system webhook %d targets %s but %s", status.ID, status.URL, status.Message)
+	}
+	return createGiteaArgoCDWebhook(ctx, port, o, giteaArgoCDWebhookURL)
+}
+
+type giteaWebhookStatus struct {
+	ID      int
+	URL     string
+	Ready   bool
+	Exists  bool
+	Message string
+}
+
+func classifyGiteaArgoCDWebhook(hooks []giteaHook) giteaWebhookStatus {
 	for _, hook := range hooks {
-		if hook.Config["url"] != webhookURL {
+		if hook.Config["url"] != giteaArgoCDWebhookURL {
 			continue
 		}
-		if hook.Active && hookHasEvent(hook, "push") {
-			return nil
+		status := giteaWebhookStatus{
+			ID:     hook.ID,
+			URL:    giteaArgoCDWebhookURL,
+			Exists: true,
 		}
-		return fmt.Errorf("Gitea ArgoCD system webhook %d targets %s but is inactive or missing push events", hook.ID, webhookURL)
+		switch {
+		case !hook.Active:
+			status.Message = "is inactive"
+		case !hookHasEvent(hook, "push"):
+			status.Message = "is missing push events"
+		default:
+			status.Ready = true
+			status.Message = "active for push events"
+		}
+		return status
 	}
-	return createGiteaArgoCDWebhook(ctx, port, o, webhookURL)
+	return giteaWebhookStatus{
+		URL:     giteaArgoCDWebhookURL,
+		Message: "missing",
+	}
 }
 
 func listGiteaSystemHooks(ctx context.Context, port int, o *options) ([]giteaHook, error) {

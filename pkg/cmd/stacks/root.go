@@ -41,6 +41,7 @@ const (
 	defaultGiteaUser                  = "giteaadmin"
 	defaultGiteaPass                  = "developer"
 	defaultRefreshMode                = refreshModeAffected
+	defaultSyncPollInterval           = 500 * time.Millisecond
 )
 
 type options struct {
@@ -60,6 +61,7 @@ type options struct {
 	ResetLocalHistory bool
 	RefreshMode       string
 	SyncWaitTimeout   time.Duration
+	SyncPollInterval  time.Duration
 	PrintRefreshPlan  bool
 	CacheDir          string
 	Recreate          bool
@@ -193,6 +195,7 @@ func newStacksCmd() *cobra.Command {
 	syncCmd.Flags().BoolVar(&opts.ResetLocalHistory, "reset-local-history", false, "replace the in-cluster Gitea branch history from the current snapshot")
 	syncCmd.Flags().StringVar(&opts.RefreshMode, "refresh-mode", opts.RefreshMode, "ArgoCD refresh mode after pushing: affected, all, or none")
 	syncCmd.Flags().DurationVar(&opts.SyncWaitTimeout, "sync-wait-timeout", opts.SyncWaitTimeout, "timeout for affected ArgoCD applications to observe the pushed revision")
+	syncCmd.Flags().DurationVar(&opts.SyncPollInterval, "sync-poll-interval", opts.SyncPollInterval, "polling interval while waiting for affected ArgoCD applications")
 	syncCmd.Flags().BoolVar(&opts.PrintRefreshPlan, "print-refresh-plan", false, "print affected ArgoCD applications for current local changes without pushing or refreshing")
 	syncCmd.Flags().StringVar(&opts.CacheDir, "cache-dir", "", "persistent cache clone directory for stacks sync")
 	syncCmd.Flags().StringVar(&opts.ContainerEngine, "container-engine", opts.ContainerEngine, "container engine for stacks provider compatibility: auto, docker, or podman")
@@ -234,6 +237,7 @@ func defaultOptions() *options {
 		WatchDebounce:       2 * time.Second,
 		RefreshMode:         defaultRefreshMode,
 		SyncWaitTimeout:     180 * time.Second,
+		SyncPollInterval:    defaultSyncPollInterval,
 		SkipAzureCheck:      true,
 		SkipTektonBuild:     true,
 		SeedImages:          true,
@@ -309,6 +313,9 @@ func (o *options) validate() error {
 	}
 	if o.SyncWaitTimeout <= 0 {
 		return fmt.Errorf("--sync-wait-timeout must be greater than 0")
+	}
+	if o.SyncPollInterval <= 0 {
+		return fmt.Errorf("--sync-poll-interval must be greater than 0")
 	}
 	if !validContainerEngine(o.ContainerEngine) {
 		return fmt.Errorf("unsupported --container-engine %q; expected auto, docker, or podman", o.ContainerEngine)

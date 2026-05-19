@@ -55,6 +55,15 @@ func status(ctx context.Context, o *options) error {
 	} else {
 		fmt.Printf("Last Gitea snapshot: unavailable\n")
 	}
+	if hook, err := giteaArgoCDWebhookStatus(ctx, o); err == nil {
+		if hook.Ready {
+			fmt.Printf("Gitea ArgoCD webhook: ready (id=%d url=%s)\n", hook.ID, hook.URL)
+		} else {
+			fmt.Printf("Gitea ArgoCD webhook: %s (url=%s)\n", hook.Message, hook.URL)
+		}
+	} else {
+		fmt.Printf("Gitea ArgoCD webhook: unavailable (%v)\n", err)
+	}
 
 	if out, err := output(ctx, o.StacksRepo, withStacksEnv(o), "kubectl", "get", "pods", "-n", "gitea", "--no-headers"); err == nil {
 		fmt.Printf("Gitea pods:\n%s", out)
@@ -67,6 +76,19 @@ func status(ctx context.Context, o *options) error {
 		fmt.Printf("ArgoCD pods: unavailable\n")
 	}
 	return nil
+}
+
+func giteaArgoCDWebhookStatus(ctx context.Context, o *options) (giteaWebhookStatus, error) {
+	pf, err := startGiteaPortForward(ctx)
+	if err != nil {
+		return giteaWebhookStatus{}, err
+	}
+	defer pf.stop()
+	hooks, err := listGiteaSystemHooks(ctx, pf.port, o)
+	if err != nil {
+		return giteaWebhookStatus{}, err
+	}
+	return classifyGiteaArgoCDWebhook(hooks), nil
 }
 
 func latestGiteaCommit(ctx context.Context, o *options) (string, error) {
