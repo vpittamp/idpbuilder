@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -477,7 +478,13 @@ func waitForApplicationsObserved(ctx context.Context, o *options, names []string
 		if len(pending) == 0 {
 			return unsyncedApplications(last, names), nil
 		}
+		if err := supersededByObservedApplicationRevision(ctx, o, names, commit, apps); err != nil {
+			return unsyncedApplications(last, names), err
+		}
 		if time.Now().After(deadline) {
+			if err := supersededByBranchRevision(ctx, o, commit); err != nil {
+				return unsyncedApplications(last, names), err
+			}
 			return unsyncedApplications(last, names), fmt.Errorf("timed out after %s waiting for applications to observe %s: %s", o.SyncWaitTimeout, shortRevision(commit), strings.Join(pending, ", "))
 		}
 		select {
@@ -486,6 +493,120 @@ func waitForApplicationsObserved(ctx context.Context, o *options, names []string
 		case <-time.After(syncPollInterval(o)):
 		}
 	}
+}
+
+type syncSupersededError struct {
+	Target       string
+	SupersededBy string
+	Detail       string
+}
+
+func (e syncSupersededError) Error() string {
+	return fmt.Sprintf("sync to %s superseded by %s: %s", shortRevision(e.Target), shortRevision(e.SupersededBy), e.Detail)
+}
+
+func supersededByObservedApplicationRevision(ctx context.Context, o *options, names []string, commit string, apps map[string]argoApplication) error {
+	for _, name := range names {
+		app, ok := apps[name]
+		if !ok {
+			continue
+		}
+		for _, revision := range observedApplicationRevisions(app) {
+			superseded, resolved := revisionSupersedesTarget(ctx, o, commit, revision)
+			if superseded {
+				return syncSupersededError{
+					Target:       commit,
+					SupersededBy: resolved,
+					Detail:       fmt.Sprintf("application %s observed newer revision %s", name, shortRevision(resolved)),
+				}
+			}
+		}
+	}
+	return nil
+}
+
+func supersededByBranchRevision(ctx context.Context, o *options, commit string) error {
+	revision, ok := currentBranchRevision(ctx, o)
+	if !ok {
+		return nil
+	}
+	superseded, resolved := revisionSupersedesTarget(ctx, o, commit, revision)
+	if !superseded {
+		return nil
+	}
+	return syncSupersededError{
+		Target:       commit,
+		SupersededBy: resolved,
+		Detail:       fmt.Sprintf("Gitea branch %s advanced past the pushed commit", o.Branch),
+	}
+}
+
+func observedApplicationRevisions(app argoApplication) []string {
+	values := make([]string, 0, 1+len(app.Status.Sync.Revisions))
+	if app.Status.Sync.Revision != "" {
+		values = append(values, app.Status.Sync.Revision)
+	}
+	values = append(values, app.Status.Sync.Revisions...)
+	return values
+}
+
+func currentBranchRevision(ctx context.Context, o *options) (string, bool) {
+	cacheDir, err := syncCachePath(o)
+	if err != nil {
+		return "", false
+	}
+	_ = runQuiet(ctx, cacheDir, "git", "fetch", "--quiet", "origin", o.Branch)
+	for _, ref := range []string{"refs/remotes/origin/" + o.Branch, "refs/heads/" + o.Branch} {
+		revision, err := gitCommitRevision(ctx, cacheDir, ref)
+		if err == nil && revision != "" {
+			return revision, true
+		}
+	}
+	return "", false
+}
+
+func revisionSupersedesTarget(ctx context.Context, o *options, target, candidate string) (bool, string) {
+	if revisionMatches(candidate, target) {
+		return false, ""
+	}
+	cacheDir, err := syncCachePath(o)
+	if err != nil {
+		return false, ""
+	}
+	targetRevision, err := gitCommitRevision(ctx, cacheDir, target)
+	if err != nil {
+		return false, ""
+	}
+	candidateRevision, err := gitCommitRevision(ctx, cacheDir, candidate)
+	if err != nil || candidateRevision == targetRevision {
+		return false, ""
+	}
+	if gitCommitIsAncestor(ctx, cacheDir, targetRevision, candidateRevision) {
+		return true, candidateRevision
+	}
+	return false, ""
+}
+
+func gitCommitRevision(ctx context.Context, dir, revision string) (string, error) {
+	out, err := output(ctx, dir, os.Environ(), "git", "rev-parse", "--verify", "--quiet", revision+"^{commit}")
+	if err != nil {
+		return "", err
+	}
+	return strings.TrimSpace(out), nil
+}
+
+func gitCommitIsAncestor(ctx context.Context, dir, ancestor, descendant string) bool {
+	cmd := exec.CommandContext(ctx, "git", "merge-base", "--is-ancestor", ancestor, descendant)
+	cmd.Dir = dir
+	cmd.Env = os.Environ()
+	return cmd.Run() == nil
+}
+
+func runQuiet(ctx context.Context, dir string, name string, args ...string) error {
+	cmd := exec.CommandContext(ctx, name, args...)
+	cmd.Dir = dir
+	cmd.Env = os.Environ()
+	return cmd.Run()
 }
 
 func syncPollInterval(o *options) time.Duration {

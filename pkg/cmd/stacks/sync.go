@@ -525,8 +525,12 @@ func pushSnapshotToRemote(ctx context.Context, remote string, o *options) (syncR
 		return syncResult{}, err
 	}
 	if o.RewriteBootstrapImagePins && (forceBootstrapRewrite || shouldRewriteBootstrapImagePins(touched)) {
+		beforeRewrite := snapshotPathHashes(cacheDir, activeDevelopmentKustomizationFiles(files))
 		if err := rewriteBootstrapImagePins(ctx, o, cacheDir); err != nil {
 			return syncResult{}, err
+		}
+		if o.WarnOnBootstrapImagePinRewrite {
+			warnRewrittenBootstrapKustomizations(cacheDir, beforeRewrite)
 		}
 	}
 	if err := run(ctx, cacheDir, os.Environ(), "git", "add", "-A"); err != nil {
@@ -1024,6 +1028,44 @@ func rewriteBootstrapImagePins(ctx context.Context, o *options, snapshotDir stri
 		return fmt.Errorf("rewriting bootstrap image pins: %w", err)
 	}
 	return nil
+}
+
+func activeDevelopmentKustomizationFiles(files []string) []string {
+	var kustomizations []string
+	for _, file := range files {
+		file = filepath.ToSlash(file)
+		if strings.HasPrefix(file, "packages/components/active-development/manifests/") && isKustomizationFileName(filepath.Base(file)) {
+			kustomizations = append(kustomizations, file)
+		}
+	}
+	sort.Strings(kustomizations)
+	return kustomizations
+}
+
+func snapshotPathHashes(root string, files []string) map[string]string {
+	hashes := map[string]string{}
+	for _, file := range files {
+		hash, err := hashSnapshotPath(root, file)
+		if err == nil {
+			hashes[file] = hash
+		}
+	}
+	return hashes
+}
+
+func warnRewrittenBootstrapKustomizations(root string, before map[string]string) {
+	var rewritten []string
+	for file, beforeHash := range before {
+		afterHash, err := hashSnapshotPath(root, file)
+		if err == nil && afterHash != beforeHash {
+			rewritten = append(rewritten, file)
+		}
+	}
+	if len(rewritten) == 0 {
+		return
+	}
+	sort.Strings(rewritten)
+	fmt.Printf("Warning: --seed-images=true rewrote active-development kustomizations in the local Gitea snapshot: %s\n", strings.Join(rewritten, ", "))
 }
 
 func bootstrapImageRewriteRegistry(o *options) string {

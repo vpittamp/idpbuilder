@@ -2,6 +2,7 @@ package stacks
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -10,6 +11,7 @@ import (
 
 	"github.com/cnoe-io/idpbuilder/pkg/cmd/helpers"
 	"github.com/spf13/cobra"
+	"golang.org/x/sys/unix"
 	"k8s.io/client-go/util/homedir"
 )
 
@@ -81,7 +83,8 @@ type options struct {
 	ReadinessProfile    string
 	WaitTarget          string
 
-	RewriteBootstrapImagePins bool
+	RewriteBootstrapImagePins      bool
+	WarnOnBootstrapImagePinRewrite bool
 
 	KubeVersion string
 
@@ -173,23 +176,37 @@ func newStacksCmd() *cobra.Command {
 	createCmd.Flags().StringSliceVar(&opts.TalosMounts, "talos-mount", nil, "Docker mount passed to talosctl cluster create docker")
 	createCmd.Flags().StringSliceVarP(&opts.TalosExposedPorts, "talos-exposed-port", "p", opts.TalosExposedPorts, "port mapping passed to talosctl cluster create docker")
 
+	syncSeedImages := false
+	syncSeedImagesMode := "release-pins"
 	syncCmd := &cobra.Command{
 		Use:   "sync",
 		Short: "Snapshot the local stacks worktree into in-cluster Gitea",
 		RunE: func(cmd *cobra.Command, args []string) error {
 			return runStacksCommand(cmd.Context(), opts, "sync", func(ctx context.Context) error {
-				syncOptions := *opts
-				syncOptions.RewriteBootstrapImagePins = opts.SeedImages && opts.SeedImagesMode == "release-pins"
-				if syncOptions.Watch {
-					return watchAndSync(ctx, &syncOptions)
+				if syncSeedImagesMode != "release-pins" {
+					return fmt.Errorf("unsupported --seed-images-mode %q; only release-pins is implemented", syncSeedImagesMode)
 				}
-				_, err := sync(ctx, &syncOptions)
-				return err
+				syncOptions := *opts
+				syncOptions.SeedImages = syncSeedImages
+				syncOptions.SeedImagesMode = syncSeedImagesMode
+				syncOptions.RewriteBootstrapImagePins = syncSeedImages && syncSeedImagesMode == "release-pins"
+				syncOptions.WarnOnBootstrapImagePinRewrite = cmd.Flags().Changed("seed-images") && syncSeedImages
+				runSync := func() error {
+					if syncOptions.Watch {
+						return watchAndSync(ctx, &syncOptions)
+					}
+					_, err := sync(ctx, &syncOptions)
+					return err
+				}
+				if syncOptions.PrintRefreshPlan {
+					return runSync()
+				}
+				return withSyncLock(&syncOptions, runSync)
 			})
 		},
 	}
-	syncCmd.Flags().BoolVar(&opts.SeedImages, "seed-images", true, "rewrite ryzen bootstrap image references from release pins into the local Gitea snapshot")
-	syncCmd.Flags().StringVar(&opts.SeedImagesMode, "seed-images-mode", "release-pins", "bootstrap image rewrite mode; only release-pins is supported")
+	syncCmd.Flags().BoolVar(&syncSeedImages, "seed-images", false, "rewrite ryzen bootstrap image references from release pins into the local Gitea snapshot")
+	syncCmd.Flags().StringVar(&syncSeedImagesMode, "seed-images-mode", "release-pins", "bootstrap image rewrite mode; only release-pins is supported")
 	syncCmd.Flags().BoolVar(&opts.Watch, "watch", false, "continue syncing local worktree changes")
 	syncCmd.Flags().DurationVar(&opts.WatchDebounce, "debounce", opts.WatchDebounce, "debounce duration for --watch")
 	syncCmd.Flags().BoolVar(&opts.ResetLocalHistory, "reset-local-history", false, "replace the in-cluster Gitea branch history from the current snapshot")
@@ -213,6 +230,67 @@ func newStacksCmd() *cobra.Command {
 
 	cmd.AddCommand(createCmd, syncCmd, statusCmd)
 	return cmd
+}
+
+type syncLock struct {
+	file *os.File
+	path string
+}
+
+func withSyncLock(o *options, fn func() error) error {
+	lock, err := acquireSyncLock(o)
+	if err != nil {
+		return err
+	}
+	defer lock.release()
+	return fn()
+}
+
+func acquireSyncLock(o *options) (*syncLock, error) {
+	lockPath, err := syncLockPath(o)
+	if err != nil {
+		return nil, err
+	}
+	if err := os.MkdirAll(filepath.Dir(lockPath), 0o755); err != nil {
+		return nil, fmt.Errorf("creating sync lock directory: %w", err)
+	}
+	file, err := os.OpenFile(lockPath, os.O_CREATE|os.O_RDWR, 0o644)
+	if err != nil {
+		return nil, fmt.Errorf("opening sync lock %s: %w", lockPath, err)
+	}
+	if err := unix.Flock(int(file.Fd()), unix.LOCK_EX|unix.LOCK_NB); err != nil {
+		_ = file.Close()
+		if errors.Is(err, unix.EWOULDBLOCK) || errors.Is(err, unix.EAGAIN) {
+			cacheDir, cacheErr := syncCachePath(o)
+			if cacheErr != nil {
+				cacheDir = "<unknown>"
+			}
+			return nil, fmt.Errorf("idpbuilder stacks sync lock is already held for cluster=%s repo=%s/%s branch=%s cache=%s; stop the active watcher/sync or use a separate --cache-dir or --branch. lock=%s",
+				o.ClusterName, o.GiteaOwner, o.GiteaRepo, o.Branch, cacheDir, lockPath)
+		}
+		return nil, fmt.Errorf("locking sync cache %s: %w", lockPath, err)
+	}
+	_ = file.Truncate(0)
+	_, _ = fmt.Fprintf(file, "pid=%d cluster=%s repo=%s/%s branch=%s started=%s\n",
+		os.Getpid(), o.ClusterName, o.GiteaOwner, o.GiteaRepo, o.Branch, time.Now().Format(time.RFC3339))
+	return &syncLock{file: file, path: lockPath}, nil
+}
+
+func (l *syncLock) release() {
+	if l == nil || l.file == nil {
+		return
+	}
+	_ = unix.Flock(int(l.file.Fd()), unix.LOCK_UN)
+	_ = l.file.Close()
+}
+
+func syncLockPath(o *options) (string, error) {
+	cacheDir, err := syncCachePath(o)
+	if err != nil {
+		return "", err
+	}
+	lockName := safeCacheSegment(o.GiteaRepo) + "." + safeCacheSegment(o.Branch) + ".lock"
+	return filepath.Join(filepath.Dir(cacheDir), lockName), nil
 }
 
 func defaultOptions() *options {

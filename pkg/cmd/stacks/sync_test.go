@@ -714,6 +714,61 @@ JSON
 	}
 }
 
+func TestWaitForApplicationsObservedReportsSupersededApplicationRevision(t *testing.T) {
+	ctx := context.Background()
+	repo := t.TempDir()
+	cacheDir, target, newer := newLinearGitCache(t)
+	binDir := t.TempDir()
+	kubectl := filepath.Join(binDir, "kubectl")
+	mustWrite(t, kubectl, `#!/usr/bin/env bash
+set -euo pipefail
+cat <<JSON
+{"items":[{"metadata":{"name":"workflow-builder"},"status":{"sync":{"status":"Synced","revision":"${TEST_NEWER_COMMIT}"},"operationState":{"phase":"Succeeded"}}}]}
+JSON
+`)
+	if err := os.Chmod(kubectl, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	t.Setenv("TEST_NEWER_COMMIT", newer)
+
+	opts := testSyncOptions(t, repo)
+	opts.CacheDir = cacheDir
+	opts.SyncWaitTimeout = time.Second
+	opts.SyncPollInterval = 5 * time.Millisecond
+	_, err := waitForApplicationsObserved(ctx, opts, []string{"workflow-builder"}, target)
+	if err == nil || !strings.Contains(err.Error(), "superseded by "+shortRevision(newer)) || !strings.Contains(err.Error(), "application workflow-builder observed newer revision") {
+		t.Fatalf("expected superseded application revision error, got %v", err)
+	}
+}
+
+func TestWaitForApplicationsObservedReportsSupersededBranchRevision(t *testing.T) {
+	ctx := context.Background()
+	repo := t.TempDir()
+	cacheDir, target, newer := newLinearGitCache(t)
+	binDir := t.TempDir()
+	kubectl := filepath.Join(binDir, "kubectl")
+	mustWrite(t, kubectl, `#!/usr/bin/env bash
+set -euo pipefail
+cat <<JSON
+{"items":[{"metadata":{"name":"workflow-builder"},"status":{"sync":{"status":"Synced","revision":"old"},"operationState":{"phase":"Succeeded"}}}]}
+JSON
+`)
+	if err := os.Chmod(kubectl, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	opts := testSyncOptions(t, repo)
+	opts.CacheDir = cacheDir
+	opts.SyncWaitTimeout = 25 * time.Millisecond
+	opts.SyncPollInterval = 5 * time.Millisecond
+	_, err := waitForApplicationsObserved(ctx, opts, []string{"workflow-builder"}, target)
+	if err == nil || !strings.Contains(err.Error(), "superseded by "+shortRevision(newer)) || !strings.Contains(err.Error(), "Gitea branch main advanced past the pushed commit") {
+		t.Fatalf("expected superseded branch revision error, got %v", err)
+	}
+}
+
 func TestRefreshAllRefreshesRootThenCurrentLiveChildren(t *testing.T) {
 	ctx := context.Background()
 	repo := t.TempDir()
@@ -819,6 +874,22 @@ func newBareRemote(t *testing.T) string {
 	remote := filepath.Join(t.TempDir(), "remote.git")
 	mustRunTest(t, "", "git", "init", "--bare", "-b", "main", remote)
 	return remote
+}
+
+func newLinearGitCache(t *testing.T) (string, string, string) {
+	t.Helper()
+	cacheDir := filepath.Join(t.TempDir(), "cache")
+	mustRunTest(t, "", "git", "init", "-b", "main", cacheDir)
+	mustRunTest(t, cacheDir, "git", "config", "user.name", "test")
+	mustRunTest(t, cacheDir, "git", "config", "user.email", "test@example.com")
+	mustWrite(t, filepath.Join(cacheDir, "tracked.txt"), "one")
+	mustRunTest(t, cacheDir, "git", "add", ".")
+	mustRunTest(t, cacheDir, "git", "commit", "-m", "one")
+	first := strings.TrimSpace(gitOutputTest(t, cacheDir, "git", "rev-parse", "HEAD"))
+	mustWrite(t, filepath.Join(cacheDir, "tracked.txt"), "two")
+	mustRunTest(t, cacheDir, "git", "commit", "-am", "two")
+	second := strings.TrimSpace(gitOutputTest(t, cacheDir, "git", "rev-parse", "HEAD"))
+	return cacheDir, first, second
 }
 
 func testSyncOptions(t *testing.T, source string) *options {
