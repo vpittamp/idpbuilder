@@ -48,6 +48,11 @@ func talosDockerCreateArgs(o *options) ([]string, error) {
 		"--cpus-controlplanes", o.TalosControlCPUs,
 		"--cpus-workers", o.TalosWorkerCPUs,
 	}
+	for _, patch := range o.TalosWorkerConfigPatches {
+		if strings.TrimSpace(patch) != "" {
+			args = append(args, "--config-patch-workers", patch)
+		}
+	}
 	for _, port := range o.TalosExposedPorts {
 		if strings.TrimSpace(port) != "" {
 			args = append(args, "--exposed-ports", port)
@@ -90,7 +95,53 @@ func prepareTalosDockerOptions(o *options) (*options, func(), error) {
 	cleanups = append(cleanups, patchCleanup)
 	prepared.TalosConfigPatches = append([]string{"@" + patch}, prepared.TalosConfigPatches...)
 
+	workerPatch, workerPatchCleanup, err := renderTalosDockerWorkerCapacityPatch(&prepared)
+	if err != nil {
+		cleanup()
+		return nil, nil, err
+	}
+	cleanups = append(cleanups, workerPatchCleanup)
+	prepared.TalosWorkerConfigPatches = append([]string{"@" + workerPatch}, prepared.TalosWorkerConfigPatches...)
+
 	return &prepared, cleanup, nil
+}
+
+func renderTalosDockerWorkerCapacityPatch(o *options) (string, func(), error) {
+	if strings.TrimSpace(o.TalosWorkerAllocCPU) == "" {
+		return "", nil, fmt.Errorf("--talos-worker-allocatable-cpu is required")
+	}
+	if strings.TrimSpace(o.TalosWorkerAllocMemory) == "" {
+		return "", nil, fmt.Errorf("--talos-worker-allocatable-memory is required")
+	}
+	content := fmt.Sprintf(`machine:
+  kubelet:
+    extraArgs:
+      feature-gates: MemoryQoS=true
+    extraConfig:
+      # Talos Docker nodes run as privileged containers, so kubelet sees
+      # host-sized capacity instead of the Docker cgroup limit. These large
+      # reservations intentionally force Kubernetes allocatable down to the
+      # real ryzen worker budget: %s CPU / %s memory inside a %s node.
+      kubeReserved:
+        cpu: 6450m
+        memory: 21Gi
+        ephemeral-storage: 2Gi
+      systemReserved:
+        cpu: 500m
+        memory: 1Gi
+        ephemeral-storage: 2Gi
+      evictionHard:
+        memory.available: 512Mi
+        nodefs.available: "10%%"
+        imagefs.available: "10%%"
+        nodefs.inodesFree: "5%%"
+        imagefs.inodesFree: "5%%"
+      enforceNodeAllocatable:
+        - pods
+      memoryThrottlingFactor: 0.85
+      memoryReservationPolicy: TieredReservation
+`, o.TalosWorkerAllocCPU, o.TalosWorkerAllocMemory, o.TalosWorkerMemory)
+	return writeTempYAML("idpbuilder-stacks-talos-docker-worker-capacity-*.yaml", content)
 }
 
 func renderTalosDockerBootstrapPatch(o *options) (string, func(), error) {

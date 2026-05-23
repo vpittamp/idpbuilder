@@ -259,13 +259,59 @@ func TestTalosDockerCreateArgsIncludeResourceLimits(t *testing.T) {
 	}
 	want := map[string]string{
 		"--memory-controlplanes": "6GiB",
-		"--memory-workers":       "6GiB",
+		"--memory-workers":       "10GiB",
 		"--cpus-controlplanes":   "4.0",
-		"--cpus-workers":         "3.0",
+		"--cpus-workers":         "5.0",
 	}
 	for flag, value := range want {
 		if !argsContainPair(args, flag, value) {
 			t.Fatalf("talosDockerCreateArgs missing %s %s in %v", flag, value, args)
+		}
+	}
+}
+
+func TestTalosDockerCreateArgsIncludeWorkerCapacityPatch(t *testing.T) {
+	o := defaultOptions()
+	o.Provider = providerTalosDocker
+	o.ClusterName = "ryzen"
+	o.KubeVersion = "v1.32.0"
+	o.TalosImage = "ghcr.io/siderolabs/talos:v1.12.4"
+	o.TalosWorkerConfigPatches = []string{"@worker-capacity.yaml"}
+	args, err := talosDockerCreateArgs(o)
+	if err != nil {
+		t.Fatalf("talosDockerCreateArgs returned error: %v", err)
+	}
+	if !argsContainPair(args, "--config-patch-workers", "@worker-capacity.yaml") {
+		t.Fatalf("talosDockerCreateArgs missing worker config patch in %v", args)
+	}
+}
+
+func TestTalosDockerWorkerCapacityPatch(t *testing.T) {
+	o := defaultOptions()
+	path, cleanup, err := renderTalosDockerWorkerCapacityPatch(o)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cleanup()
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := string(raw)
+	for _, want := range []string{
+		"feature-gates: MemoryQoS=true",
+		"kubeReserved:",
+		"cpu: 6450m",
+		"memory: 21Gi",
+		"systemReserved:",
+		"memory: 1Gi",
+		"memory.available: 512Mi",
+		"memoryThrottlingFactor: 0.85",
+		"memoryReservationPolicy: TieredReservation",
+		"5000m CPU / 8Gi memory inside a 10GiB node",
+	} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("worker capacity patch missing %q: %s", want, got)
 		}
 	}
 }

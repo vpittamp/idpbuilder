@@ -88,17 +88,20 @@ type options struct {
 
 	KubeVersion string
 
-	TalosImage         string
-	TalosSubnet        string
-	TalosWorkers       int
-	TalosControlMemory string
-	TalosWorkerMemory  string
-	TalosControlCPUs   string
-	TalosWorkerCPUs    string
-	TalosOIDCIssuerURL string
-	TalosConfigPatches []string
-	TalosMounts        []string
-	TalosExposedPorts  []string
+	TalosImage               string
+	TalosSubnet              string
+	TalosWorkers             int
+	TalosControlMemory       string
+	TalosWorkerMemory        string
+	TalosControlCPUs         string
+	TalosWorkerCPUs          string
+	TalosWorkerAllocCPU      string
+	TalosWorkerAllocMemory   string
+	TalosOIDCIssuerURL       string
+	TalosConfigPatches       []string
+	TalosWorkerConfigPatches []string
+	TalosMounts              []string
+	TalosExposedPorts        []string
 }
 
 // StacksCmd adds PittampalliOrg stacks-specific local cluster workflows without
@@ -171,8 +174,11 @@ func newStacksCmd() *cobra.Command {
 	createCmd.Flags().StringVar(&opts.TalosWorkerMemory, "talos-worker-memory", opts.TalosWorkerMemory, "memory limit for each talos-docker worker node")
 	createCmd.Flags().StringVar(&opts.TalosControlCPUs, "talos-controlplane-cpus", opts.TalosControlCPUs, "CPU share for each talos-docker control plane node")
 	createCmd.Flags().StringVar(&opts.TalosWorkerCPUs, "talos-worker-cpus", opts.TalosWorkerCPUs, "CPU share for each talos-docker worker node")
+	createCmd.Flags().StringVar(&opts.TalosWorkerAllocCPU, "talos-worker-allocatable-cpu", opts.TalosWorkerAllocCPU, "target Kubernetes allocatable CPU for each talos-docker worker")
+	createCmd.Flags().StringVar(&opts.TalosWorkerAllocMemory, "talos-worker-allocatable-memory", opts.TalosWorkerAllocMemory, "target Kubernetes allocatable memory for each talos-docker worker")
 	createCmd.Flags().StringVar(&opts.TalosOIDCIssuerURL, "talos-oidc-issuer-url", opts.TalosOIDCIssuerURL, "service-account issuer URL for talos-docker Azure Workload Identity")
 	createCmd.Flags().StringSliceVar(&opts.TalosConfigPatches, "talos-config-patch", nil, "Talos machine config patch passed to talosctl cluster create docker")
+	createCmd.Flags().StringSliceVar(&opts.TalosWorkerConfigPatches, "talos-worker-config-patch", nil, "Talos worker machine config patch passed to talosctl cluster create docker")
 	createCmd.Flags().StringSliceVar(&opts.TalosMounts, "talos-mount", nil, "Docker mount passed to talosctl cluster create docker")
 	createCmd.Flags().StringSliceVarP(&opts.TalosExposedPorts, "talos-exposed-port", "p", opts.TalosExposedPorts, "port mapping passed to talosctl cluster create docker")
 
@@ -301,38 +307,40 @@ func defaultOptions() *options {
 		}
 	}
 	return &options{
-		Profile:             defaultProfile,
-		Provider:            providerTalosDocker,
-		StacksRepo:          stacksRepo,
-		Overlay:             defaultOverlay,
-		Branch:              defaultBranch,
-		ClusterName:         defaultClusterName,
-		GiteaOwner:          defaultGiteaUser,
-		GiteaRepo:           "stacks",
-		GiteaUser:           defaultGiteaUser,
-		GiteaPassword:       defaultGiteaPass,
-		WatchInterval:       3 * time.Second,
-		WatchDebounce:       2 * time.Second,
-		RefreshMode:         defaultRefreshMode,
-		SyncWaitTimeout:     180 * time.Second,
-		SyncPollInterval:    defaultSyncPollInterval,
-		SkipAzureCheck:      true,
-		SkipTektonBuild:     true,
-		SeedImages:          true,
-		SeedImagesMode:      "release-pins",
-		SeedImageJobs:       6,
-		SeedImagePushEngine: envOrDefault("IDPBUILDER_STACKS_SEED_IMAGE_PUSH_ENGINE", seedImagePushEngineAuto),
-		ContainerEngine:     envOrDefault("IDPBUILDER_STACKS_CONTAINER_ENGINE", containerEngineAuto),
-		RefreshKubeconfig:   true,
-		ReadinessProfile:    defaultReadinessProfile,
-		WaitTarget:          waitTargetInnerLoop,
-		TalosSubnet:         "10.6.0.0/24",
-		TalosWorkers:        2,
-		TalosControlMemory:  "6GiB",
-		TalosWorkerMemory:   "6GiB",
-		TalosControlCPUs:    "4.0",
-		TalosWorkerCPUs:     "3.0",
-		TalosOIDCIssuerURL:  "https://oidcissuer65846b7df97b.z13.web.core.windows.net/",
+		Profile:                defaultProfile,
+		Provider:               providerTalosDocker,
+		StacksRepo:             stacksRepo,
+		Overlay:                defaultOverlay,
+		Branch:                 defaultBranch,
+		ClusterName:            defaultClusterName,
+		GiteaOwner:             defaultGiteaUser,
+		GiteaRepo:              "stacks",
+		GiteaUser:              defaultGiteaUser,
+		GiteaPassword:          defaultGiteaPass,
+		WatchInterval:          3 * time.Second,
+		WatchDebounce:          2 * time.Second,
+		RefreshMode:            defaultRefreshMode,
+		SyncWaitTimeout:        180 * time.Second,
+		SyncPollInterval:       defaultSyncPollInterval,
+		SkipAzureCheck:         true,
+		SkipTektonBuild:        true,
+		SeedImages:             true,
+		SeedImagesMode:         "release-pins",
+		SeedImageJobs:          6,
+		SeedImagePushEngine:    envOrDefault("IDPBUILDER_STACKS_SEED_IMAGE_PUSH_ENGINE", seedImagePushEngineAuto),
+		ContainerEngine:        envOrDefault("IDPBUILDER_STACKS_CONTAINER_ENGINE", containerEngineAuto),
+		RefreshKubeconfig:      true,
+		ReadinessProfile:       defaultReadinessProfile,
+		WaitTarget:             waitTargetInnerLoop,
+		TalosSubnet:            "10.6.0.0/24",
+		TalosWorkers:           2,
+		TalosControlMemory:     "6GiB",
+		TalosWorkerMemory:      "10GiB",
+		TalosControlCPUs:       "4.0",
+		TalosWorkerCPUs:        "5.0",
+		TalosWorkerAllocCPU:    "5000m",
+		TalosWorkerAllocMemory: "8Gi",
+		TalosOIDCIssuerURL:     "https://oidcissuer65846b7df97b.z13.web.core.windows.net/",
 		TalosExposedPorts: []string{
 			"9443:443/tcp",
 		},

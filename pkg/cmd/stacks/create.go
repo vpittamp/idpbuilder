@@ -2,9 +2,11 @@ package stacks
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	syncpkg "sync"
 	"time"
@@ -160,7 +162,124 @@ func createTalosDocker(ctx context.Context, o *options) (err error) {
 	if err := useTalosDockerKubeContext(ctx, o); err != nil {
 		return err
 	}
+	if err := withReadinessPhase(ctx, o, "talos-docker-worker-labels", func() error {
+		return ensureTalosDockerWorkerLabels(ctx, o)
+	}); err != nil {
+		return err
+	}
+	if err := withReadinessPhase(ctx, o, "talos-docker-capacity-check", func() error {
+		return validateTalosDockerCapacity(ctx, o)
+	}); err != nil {
+		return err
+	}
 	return bootstrapStacksGitOps(ctx, o, postDeleteCleanup)
+}
+
+func validateTalosDockerCapacity(ctx context.Context, o *options) error {
+	if err := validateTalosDockerContainerLimits(ctx, o); err != nil {
+		return err
+	}
+	return validateTalosDockerNodeAllocatable(ctx, o)
+}
+
+func ensureTalosDockerWorkerLabels(ctx context.Context, o *options) error {
+	for i := 1; i <= o.TalosWorkers; i++ {
+		name := fmt.Sprintf("%s-worker-%d", o.ClusterName, i)
+		if err := run(ctx, o.StacksRepo, withStacksEnv(o), "kubectl", "label", "node", name,
+			"node-role.kubernetes.io/worker=", "stacks.io/swebench-pool=dev-benchmark", "--overwrite"); err != nil {
+			return fmt.Errorf("labeling Talos Docker worker %s: %w", name, err)
+		}
+	}
+	return nil
+}
+
+func validateTalosDockerContainerLimits(ctx context.Context, o *options) error {
+	engine, err := resolveContainerEngine(o)
+	if err != nil {
+		return err
+	}
+	wantMemory, err := parseBinaryQuantityBytes(o.TalosWorkerMemory)
+	if err != nil {
+		return fmt.Errorf("parsing --talos-worker-memory for capacity validation: %w", err)
+	}
+	wantCPUNano, err := parseCPUNano(o.TalosWorkerCPUs)
+	if err != nil {
+		return fmt.Errorf("parsing --talos-worker-cpus for capacity validation: %w", err)
+	}
+	type inspectResult struct {
+		HostConfig struct {
+			Memory   int64 `json:"Memory"`
+			NanoCPUs int64 `json:"NanoCpus"`
+		} `json:"HostConfig"`
+	}
+	for i := 1; i <= o.TalosWorkers; i++ {
+		name := fmt.Sprintf("%s-worker-%d", o.ClusterName, i)
+		raw, err := output(ctx, o.StacksRepo, withStacksEnv(o), engine, "inspect", name)
+		if err != nil {
+			return fmt.Errorf("inspecting Talos Docker worker %s with %s: %w", name, engine, err)
+		}
+		var decoded []inspectResult
+		if err := json.Unmarshal([]byte(raw), &decoded); err != nil || len(decoded) == 0 {
+			return fmt.Errorf("decoding %s inspect output for %s: %w", engine, name, err)
+		}
+		gotMemory := decoded[0].HostConfig.Memory
+		gotCPUNano := decoded[0].HostConfig.NanoCPUs
+		if !withinPercent(float64(gotMemory), float64(wantMemory), 0.02) {
+			return fmt.Errorf("%s memory limit = %d bytes, want %s (%d bytes); recreate ryzen with the current idpbuilder capacity defaults", name, gotMemory, o.TalosWorkerMemory, wantMemory)
+		}
+		if !withinPercent(float64(gotCPUNano), float64(wantCPUNano), 0.02) {
+			return fmt.Errorf("%s CPU limit = %d NanoCPUs, want %s (%d NanoCPUs); recreate ryzen with the current idpbuilder capacity defaults", name, gotCPUNano, o.TalosWorkerCPUs, wantCPUNano)
+		}
+	}
+	return nil
+}
+
+func validateTalosDockerNodeAllocatable(ctx context.Context, o *options) error {
+	raw, err := output(ctx, o.StacksRepo, withStacksEnv(o), "kubectl", "get", "nodes", "-l", "node-role.kubernetes.io/worker=", "-o", "json")
+	if err != nil {
+		return fmt.Errorf("reading worker node allocatable capacity: %w", err)
+	}
+	var nodes struct {
+		Items []struct {
+			Metadata struct {
+				Name string `json:"name"`
+			} `json:"metadata"`
+			Status struct {
+				Allocatable map[string]string `json:"allocatable"`
+			} `json:"status"`
+		} `json:"items"`
+	}
+	if err := json.Unmarshal([]byte(raw), &nodes); err != nil {
+		return fmt.Errorf("decoding worker node allocatable capacity: %w", err)
+	}
+	if len(nodes.Items) != o.TalosWorkers {
+		return fmt.Errorf("found %d worker nodes, want %d", len(nodes.Items), o.TalosWorkers)
+	}
+	wantCPU, err := parseCPUCore(o.TalosWorkerAllocCPU)
+	if err != nil {
+		return fmt.Errorf("parsing --talos-worker-allocatable-cpu: %w", err)
+	}
+	wantMemory, err := parseBinaryQuantityBytes(o.TalosWorkerAllocMemory)
+	if err != nil {
+		return fmt.Errorf("parsing --talos-worker-allocatable-memory: %w", err)
+	}
+	for _, node := range nodes.Items {
+		gotCPU, err := parseCPUCore(node.Status.Allocatable["cpu"])
+		if err != nil {
+			return fmt.Errorf("parsing %s allocatable cpu %q: %w", node.Metadata.Name, node.Status.Allocatable["cpu"], err)
+		}
+		gotMemory, err := parseBinaryQuantityBytes(node.Status.Allocatable["memory"])
+		if err != nil {
+			return fmt.Errorf("parsing %s allocatable memory %q: %w", node.Metadata.Name, node.Status.Allocatable["memory"], err)
+		}
+		if !withinPercent(gotCPU, wantCPU, 0.20) {
+			return fmt.Errorf("%s allocatable cpu = %s, want about %s; kubelet is not advertising ryzen Talos-Docker capacity truth", node.Metadata.Name, node.Status.Allocatable["cpu"], o.TalosWorkerAllocCPU)
+		}
+		if !withinPercent(float64(gotMemory), float64(wantMemory), 0.20) {
+			return fmt.Errorf("%s allocatable memory = %s, want about %s; kubelet is not advertising ryzen Talos-Docker capacity truth", node.Metadata.Name, node.Status.Allocatable["memory"], o.TalosWorkerAllocMemory)
+		}
+	}
+	return nil
 }
 
 func bootstrapStacksGitOps(ctx context.Context, o *options, postDeleteCleanup *asyncReadinessPhase) error {
@@ -530,4 +649,76 @@ func talosDockerKubeconfigNameMatches(name, base string) bool {
 		}
 	}
 	return true
+}
+
+func parseCPUCore(value string) (float64, error) {
+	raw := strings.TrimSpace(value)
+	if raw == "" {
+		return 0, fmt.Errorf("empty CPU quantity")
+	}
+	switch {
+	case strings.HasSuffix(raw, "m"):
+		v, err := strconv.ParseFloat(strings.TrimSuffix(raw, "m"), 64)
+		if err != nil {
+			return 0, err
+		}
+		return v / 1000, nil
+	case strings.HasSuffix(raw, "n"):
+		v, err := strconv.ParseFloat(strings.TrimSuffix(raw, "n"), 64)
+		if err != nil {
+			return 0, err
+		}
+		return v / 1_000_000_000, nil
+	default:
+		return strconv.ParseFloat(raw, 64)
+	}
+}
+
+func parseCPUNano(value string) (int64, error) {
+	cores, err := parseCPUCore(value)
+	if err != nil {
+		return 0, err
+	}
+	return int64(cores * 1_000_000_000), nil
+}
+
+func parseBinaryQuantityBytes(value string) (int64, error) {
+	raw := strings.TrimSpace(value)
+	if raw == "" {
+		return 0, fmt.Errorf("empty memory quantity")
+	}
+	units := []struct {
+		suffix string
+		factor float64
+	}{
+		{"KiB", 1024},
+		{"MiB", 1024 * 1024},
+		{"GiB", 1024 * 1024 * 1024},
+		{"TiB", 1024 * 1024 * 1024 * 1024},
+		{"Ki", 1024},
+		{"Mi", 1024 * 1024},
+		{"Gi", 1024 * 1024 * 1024},
+		{"Ti", 1024 * 1024 * 1024 * 1024},
+	}
+	for _, unit := range units {
+		if strings.HasSuffix(raw, unit.suffix) {
+			v, err := strconv.ParseFloat(strings.TrimSuffix(raw, unit.suffix), 64)
+			if err != nil {
+				return 0, err
+			}
+			return int64(v * unit.factor), nil
+		}
+	}
+	return strconv.ParseInt(raw, 10, 64)
+}
+
+func withinPercent(got, want, tolerance float64) bool {
+	if want == 0 {
+		return got == 0
+	}
+	diff := got - want
+	if diff < 0 {
+		diff = -diff
+	}
+	return diff/want <= tolerance
 }
